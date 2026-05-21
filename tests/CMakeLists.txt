@@ -110,6 +110,7 @@ set(BENCHMARK_FILES
 # Regular test sources (unit tests, integration tests)
 set(TEST_FILES
     test_block_store.cpp
+    test_frustum_culler.cpp
     test_loss_gradients.cpp
     test_regularization_comparison.cpp
     test_gut_rasterizer_gradients.cpp

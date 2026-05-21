@@ -89,6 +89,8 @@ set(TRAINING_NEW_SOURCES
     components/sparsity_optimizer.cpp
     control/command_api.cpp
     metrics/metrics.cpp
+    tide/working_set.cpp
+    tide/frustum_culler.cpp
     checkpoint.cpp
     trainer.cpp
     training_setup.cpp

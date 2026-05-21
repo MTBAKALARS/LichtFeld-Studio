@@ -40,3 +40,5 @@ lichtfeld-studio.aps
 *.pyc
 src/python/stubs/lichtfeld/build_info.pyi
 tasks/
+_tide_build.log
+
