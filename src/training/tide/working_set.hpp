@@ -28,17 +28,24 @@ namespace lfs::training::tide {
      * @brief GPU-resident packed view of a working set of Gaussian blocks.
      *
      * Implements the VRAM tier of TideGS's SSD-CPU-GPU hierarchy (arXiv:2605.20150
-     * Sec. 3.5). A WorkingSet owns a single GPU buffer sized for @ref capacity_blocks
-     * blocks of `BlockStore::bytes_per_block()` bytes each, plus a `block_to_local_slice`
-     * mapping that lets the rasterizer find a specific block's contiguous slice in
-     * the active buffer.
+     * Sec. 3.5). A WorkingSet owns **two** GPU buffers (A/B double-buffer), each
+     * sized for @ref capacity_blocks blocks of `BlockStore::bytes_per_block()` bytes,
+     * plus a per-buffer `block_to_local_slice` mapping that lets the rasterizer find
+     * a specific block's contiguous slice in the active buffer.
      *
-     * **This is the Phase 2 V1: synchronous H2D loads.** The A/B double-buffer +
-     * async prefetch pipeline (paper's Algorithm 1) is a deliberate follow-up;
-     * a synchronous version is enough to wire Phase 3's trainer integration end-to-end
-     * and validates the data plumbing on real data before we add overlap.
+     * **Phase 2.5 (this implementation): A/B double-buffer + async prefetch.**
+     * `prefetch()` stages the next resident set into the inactive buffer on a
+     * dedicated CUDA stream and returns immediately. `wait_and_activate()` blocks
+     * on the prefetch completion event and atomically swaps which buffer is active.
+     * Retained blocks (still visible across frames) are copied D2D from the old
+     * active buffer to the new one — no host round-trip. Only fresh arrivals incur
+     * an H2D `cudaMemcpyAsync` from pinned host memory.
      *
-     * Memory layout in the active buffer (CACHE order, identical to the BlockStore
+     * The synchronous helper `load_and_activate()` is preserved as a convenience
+     * (= `prefetch()` + `wait_and_activate()`) for code paths that don't overlap
+     * training with prefetch.
+     *
+     * Memory layout in each buffer (CACHE order, identical to the BlockStore
      * on-disk format):
      *
      *     [block_0 (4096 Gaussians × 236 B)] [block_1 ...] ... [block_{N-1} ...]
@@ -46,7 +53,10 @@ namespace lfs::training::tide {
      * Per-Gaussian byte layout is fixed by @ref BlockStore::kBytesPerGaussian = 236.
      *
      * Thread-safety: not safe for concurrent calls. The trainer owns one WorkingSet
-     * and drives it from the main training thread.
+     * and drives it from the main training thread. Concurrency between prefetch
+     * (writes to inactive buffer on prefetch stream) and trainer kernels (reads
+     * from active buffer on the default stream) is safe because they touch disjoint
+     * device memory.
      */
     class WorkingSet {
     public:
@@ -57,16 +67,19 @@ namespace lfs::training::tide {
         };
 
         struct Config {
-            std::size_t capacity_blocks = 0;     ///< Hard cap on resident block count in VRAM
+            std::size_t capacity_blocks = 0;     ///< Hard cap on resident block count per buffer in VRAM
             std::size_t bytes_per_block = 0;     ///< Must match BlockStore::bytes_per_block()
             int cuda_device = 0;                 ///< GPU index for cudaSetDevice
         };
 
         struct Stats {
-            std::uint64_t loads = 0;             ///< Number of begin_load → activate cycles
-            std::uint64_t blocks_uploaded = 0;
-            std::uint64_t bytes_uploaded = 0;
-            std::uint64_t blocks_retained = 0;   ///< Blocks already resident from prior frame
+            std::uint64_t loads            = 0;  ///< Number of completed load_and_activate cycles
+            std::uint64_t prefetches       = 0;  ///< Number of prefetch() calls issued
+            std::uint64_t activates        = 0;  ///< Number of wait_and_activate() calls completed
+            std::uint64_t blocks_uploaded  = 0;  ///< Blocks H2D-copied from pinned host
+            std::uint64_t bytes_uploaded   = 0;  ///< Bytes H2D-copied from pinned host
+            std::uint64_t blocks_retained  = 0;  ///< Blocks already resident from prior frame (D2D-copied)
+            std::uint64_t bytes_d2d_copied = 0;  ///< Bytes D2D-copied for retention across the A/B swap
         };
 
         ~WorkingSet();
@@ -76,26 +89,61 @@ namespace lfs::training::tide {
         WorkingSet& operator=(WorkingSet&&) noexcept;
 
         /**
-         * @brief Allocate the GPU buffer and a dedicated CUDA stream.
+         * @brief Allocate the two GPU buffers, the prefetch stream, and a completion event.
          *
-         * @return WorkingSet on success; descriptive error on cuMalloc/stream failure.
+         * @return WorkingSet on success; descriptive error on cudaMalloc/stream failure.
          */
         static std::expected<std::unique_ptr<WorkingSet>, std::string>
         create(const Config& config);
 
         /**
-         * @brief Stage the next resident set into VRAM and activate it.
+         * @brief Stage the next resident set into the **inactive** GPU buffer (async).
          *
-         * Synchronously H2D-copies each non-retained block from the @p cache into
-         * the GPU buffer, then `cudaStreamSynchronize` on the dedicated stream.
-         * Blocks already resident from the prior call are kept in place
-         * (their `local_index` is preserved); freshly evicted block slots are
-         * reused for the new arrivals.
+         * For each id in @p block_ids:
+         *   - If already resident in the active buffer → D2D-copy bytes into the
+         *     inactive buffer (no host round-trip).
+         *   - Otherwise → pin via `cache.get()` and H2D `cudaMemcpyAsync` into the
+         *     inactive buffer.
          *
-         * @param cache Source of pinned-host block bytes. Each block_id is pinned
-         *              via @ref TieredCache::get for the duration of the H2D, then unpinned.
-         * @param block_ids Sorted, unique list of block_ids that must be resident
-         *                  after this call returns. `block_ids.size() <= capacity_blocks`.
+         * All copies run on the dedicated prefetch stream; the function records a
+         * cudaEvent and returns without blocking. Call @ref wait_and_activate to
+         * publish the new buffer.
+         *
+         * Note: it is an error to call prefetch() twice without an intervening
+         * wait_and_activate(). Callers that want to abandon a prefetch must
+         * complete it via wait_and_activate() first.
+         *
+         * @param cache Source of pinned-host block bytes. Pinned ids stay pinned
+         *              until wait_and_activate() releases them.
+         * @param block_ids Unique list of block_ids that must be resident after
+         *                  the next wait_and_activate(). `size() <= capacity_blocks`.
+         */
+        std::expected<void, std::string>
+        prefetch(lfs::core::TieredCache& cache,
+                 std::span<const std::size_t> block_ids);
+
+        /**
+         * @brief Block on the pending prefetch, then atomically swap A/B.
+         *
+         * After return, @ref device_buffer / @ref active_slices reflect the set
+         * staged by the most recent prefetch(). Pinned host pages from that
+         * prefetch are released.
+         *
+         * Returns an error if no prefetch is currently in flight, or if the
+         * `cudaEventSynchronize` fails.
+         */
+        std::expected<void, std::string>
+        wait_and_activate();
+
+        /// True between a prefetch() and its matching wait_and_activate().
+        bool prefetch_pending() const noexcept;
+
+        /**
+         * @brief Synchronous convenience: prefetch(block_ids) then wait_and_activate().
+         *
+         * Equivalent to the Phase 2 V1 behavior. Suitable when the trainer cannot
+         * overlap a prefetch with the current iteration (e.g. first iteration,
+         * or end-to-end debugging).
          */
         std::expected<void, std::string>
         load_and_activate(lfs::core::TieredCache& cache,
