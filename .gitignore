@@ -42,3 +42,9 @@ src/python/stubs/lichtfeld/build_info.pyi
 tasks/
 _tide_build.log
 
+
+# Local-only Tide build helpers (Windows MSVC 14.44 + CUDA 12.9)
+_*.ps1
+_*.log
+_probe_*/
+Directory.Build.props
