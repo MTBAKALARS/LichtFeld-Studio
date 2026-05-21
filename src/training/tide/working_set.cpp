@@ -29,6 +29,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 
@@ -36,7 +38,7 @@ namespace lfs::training::tide {
 
     namespace {
 
-        std::string cuda_err(const char* what, cudaError_t e) {
+        std::string cuda_err(std::string_view what, cudaError_t e) {
             return std::string(what) + ": " + cudaGetErrorString(e);
         }
 

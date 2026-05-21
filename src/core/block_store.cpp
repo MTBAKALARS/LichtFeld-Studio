@@ -135,8 +135,7 @@ namespace lfs::core {
         // close() is idempotent; ignore error path here (logged inside).
         (void)close();
     }
-    BlockStore::BlockStore(BlockStore&&) noexcept = default;
-    BlockStore& BlockStore::operator=(BlockStore&&) noexcept = default;
+    // Move operations are deleted in the header (mutex member).
 
     // ============================================================
     // create / open

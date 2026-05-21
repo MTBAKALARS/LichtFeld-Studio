@@ -86,8 +86,12 @@ namespace lfs::core {
 
         BlockStore(const BlockStore&) = delete;
         BlockStore& operator=(const BlockStore&) = delete;
-        BlockStore(BlockStore&&) noexcept;
-        BlockStore& operator=(BlockStore&&) noexcept;
+        // Non-movable: held via std::unique_ptr<BlockStore> from the static
+        // factories (create / open / stream_ply_to_base). The class owns a
+        // std::mutex directly (bounds_mutex_), which is neither copyable nor
+        // movable, so the implicitly-synthesized move operations cannot exist.
+        BlockStore(BlockStore&&)            = delete;
+        BlockStore& operator=(BlockStore&&) = delete;
 
         // === Lifecycle ===
 
