@@ -48,6 +48,7 @@ set(CORE_SOURCES
         animatable_property.cpp
         argument_parser.cpp
         block_store.cpp
+        block_store_ply_init.cpp
         camera.cpp
         checkpoint_format.cpp
         cuda_alloc_tracker.cpp

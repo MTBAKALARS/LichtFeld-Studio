@@ -109,6 +109,72 @@ namespace lfs::core {
             const Config& config = {});
 
         /**
+         * @brief CPU-side view of an in-memory Gaussian set for streaming initialization.
+         *
+         * All spans must contain @ref num_gaussians elements along the leading axis,
+         * laid out contiguously in float32. Optimizer-raw values are expected (i.e.
+         * pre-sigmoid opacity, log-space scaling) — these match SplatData's `*_raw`
+         * accessors and the on-disk PLY convention used by 3DGS.
+         *
+         * Per-attribute layout:
+         *   - means    : N * 3 (xyz)
+         *   - scaling  : N * 3 (raw / log-space)
+         *   - rotation : N * 4 (quaternion, layout matches SplatData)
+         *   - opacity  : N * 1 (raw / pre-sigmoid)
+         *   - sh0      : N * 3 (DC SH coefficients, R/G/B)
+         *   - shN      : N * (sh_rest_components) — typically 45 for SH-3
+         *
+         * The store layout always packs CACHE order:
+         *   [xyz | scale | rot | opacity | dc | rest=45]
+         * If sh0/shN have fewer components than 3/45, the remainder is zero-padded;
+         * if more, extras are truncated with a warning.
+         */
+        struct PlySource {
+            std::span<const float> means;
+            std::span<const float> scaling;
+            std::span<const float> rotation;
+            std::span<const float> opacity;
+            std::span<const float> sh0;
+            std::span<const float> shN;
+            std::size_t num_gaussians = 0;
+            std::size_t sh_rest_components = 45; ///< 15 * 3 for SH-3
+        };
+
+        /// Optional knobs for @ref stream_ply_to_base.
+        struct StreamPlyOptions {
+            /// Hard ceiling on N for the in-memory path. Above this we refuse to
+            /// allocate the output buffer (would exceed practical RAM); a future
+            /// external-memory bucket sort path will lift this.
+            std::size_t max_in_memory_gaussians = 250'000'000ULL;
+            /// Number of Morton bits per axis (3 * bits ≤ 64). 21 is the standard
+            /// choice and yields a uniform 2 097 152^3 grid resolution.
+            std::uint32_t morton_bits_per_axis = 21;
+        };
+
+        /**
+         * @brief Build a fresh store from a CPU-side Gaussian set.
+         *
+         * Implements TideGS's "streaming PLY init" (Sec. 3.2) but currently fully
+         * in memory: the caller supplies CPU-resident spans, this function computes
+         * a 21-bit-per-axis Morton ordering over the global bounding box, reorders
+         * attributes into CACHE layout, derives per-block bounding spheres, and
+         * delegates to @ref create to materialize the on-disk store.
+         *
+         * Caps at @ref StreamPlyOptions::max_in_memory_gaussians; an external-memory
+         * bucket-spill variant for billion-scale PLYs is tracked as future work.
+         *
+         * @param dir Target directory (must not already contain a store).
+         * @param src CPU-side Gaussian arrays (see @ref PlySource).
+         * @param config Same Config that will be used to subsequently @ref open the store.
+         * @param opts Streaming-init knobs; defaults are reasonable.
+         */
+        static std::expected<std::unique_ptr<BlockStore>, std::string> stream_ply_to_base(
+            const std::filesystem::path& dir,
+            const PlySource& src,
+            const Config& config = {},
+            const StreamPlyOptions& opts = {});
+
+        /**
          * @brief Open an existing store from disk.
          *
          * Memory-maps the base segment and any patch segments, replays the index file.
