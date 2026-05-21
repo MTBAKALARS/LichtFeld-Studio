@@ -47,6 +47,7 @@ set(CORE_SOURCES
         operator_callbacks.cpp
         animatable_property.cpp
         argument_parser.cpp
+        block_store.cpp
         camera.cpp
         checkpoint_format.cpp
         cuda_alloc_tracker.cpp
@@ -61,6 +62,7 @@ set(CORE_SOURCES
         splat_data_mirror.cpp
         splat_data_transform.cpp
         tensor_debug.cpp
+        tiered_cache.cpp
         training_snapshot.cpp
         mesh_data.cpp
 )
