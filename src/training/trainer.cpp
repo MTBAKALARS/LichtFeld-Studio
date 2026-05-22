@@ -1880,6 +1880,19 @@ namespace lfs::training {
                 return StepResult::Stop;
             }
 
+            // Phase 3.5.1: camera-aware setup hook. Strategies that need to
+            // know the current camera before the rasterizer runs (Tide-class
+            // strategies for frustum-driven block prefetch) override
+            // IStrategy::pre_forward. Default impl is a no-op so this is safe
+            // for every strategy. Must run AFTER camera selection and pause
+            // checks, BEFORE any work that reads from the model (background
+            // image fetch, rasterize_forward).
+            if (strategy_ && cam) {
+                nvtxRangePush("strategy_pre_forward");
+                strategy_->pre_forward(iter, *cam);
+                nvtxRangePop();
+            }
+
             nvtxRangePush("background_for_step");
             lfs::core::Tensor& bg = background_for_step(iter);
             nvtxRangePop();

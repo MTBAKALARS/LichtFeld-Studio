@@ -330,6 +330,21 @@ namespace lfs::training {
 
     // ----------------------------------------------------------------------
 
+    void TideStrategy::pre_forward(int /*iter*/, const lfs::core::Camera& /*cam*/) {
+        // Phase 3.5.1: callback wiring only. The trainer now invokes this hook
+        // every iteration (just after camera selection, just before
+        // rasterize_forward) regardless of whether a WorkingSet is attached.
+        // Behavior is intentionally a no-op so this commit is a pure refactor:
+        // the WorkingSet's resident set continues to be populated up-front by
+        // trainer init via `activate_all_blocks`.
+        //
+        // Phase 3.5.2 will move the activation here: compute the camera's 6
+        // frustum planes, run FrustumCuller against block bounds, and request
+        // the visible block IDs from the WorkingSet (sync first, then async).
+        // From that point on, the trainer-side `activate_all_blocks` call
+        // becomes unreachable and is removed.
+    }
+
     void TideStrategy::pre_step(int /*iter*/, RenderOutput& /*render_output*/) {
         if (!impl_->working_set) {
             // Phase 3.2b shell path: no working set, SplatData view was

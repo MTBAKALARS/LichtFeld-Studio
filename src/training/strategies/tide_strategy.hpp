@@ -72,6 +72,7 @@ namespace lfs::training {
 
         // IStrategy interface ----------------------------------------------
         void initialize(const lfs::core::param::OptimizationParameters& optimParams) override;
+        void pre_forward(int iter, const lfs::core::Camera& cam) override;
         void pre_step(int iter, RenderOutput& render_output) override;
         void post_backward(int iter, RenderOutput& render_output) override;
         void step(int iter) override;

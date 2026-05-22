@@ -15,6 +15,10 @@ namespace lfs::io {
     class PipelinedImageLoader;
 }
 
+namespace lfs::core {
+    class Camera;
+}
+
 namespace lfs::training {
 
     class CameraDataset;
@@ -30,6 +34,21 @@ namespace lfs::training {
         virtual ~IStrategy() = default;
 
         virtual void initialize(const lfs::core::param::OptimizationParameters& optimParams) = 0;
+
+        /// Phase 3.5: hook called by the trainer immediately BEFORE the
+        /// per-iteration rasterizer forward pass, after the current camera
+        /// has been selected. Default no-op for strategies that don't need
+        /// camera-aware setup. Tide-class strategies override this to
+        /// frustum-cull blocks and ensure the resident set covers the visible
+        /// region (issuing async prefetches and `wait_and_activate` on the
+        /// WorkingSet).
+        ///
+        /// Contract: callers MUST invoke this between camera selection and
+        /// rasterize_forward. Implementations MUST be safe to call every
+        /// iteration; they may issue synchronous loads on the first call and
+        /// short-circuit on subsequent calls if the resident set already
+        /// covers the camera.
+        virtual void pre_forward(int /*iter*/, const lfs::core::Camera& /*cam*/) {}
 
         virtual void pre_step(int /*iter*/, RenderOutput& /*render_output*/) {}
 

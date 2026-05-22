@@ -1,12 +1,15 @@
 /* SPDX-FileCopyrightText: 2026 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
+#include "core/camera.hpp"
+#include "core/camera_types.h"
 #include "core/parameters.hpp"
 #include "core/splat_data.hpp"
 #include "strategies/strategy_factory.hpp"
 #include "strategies/tide_strategy.hpp"
 
 #include <cuda_runtime.h>
+#include <filesystem>
 #include <gtest/gtest.h>
 #include <memory>
 #include <sstream>
@@ -58,6 +61,27 @@ namespace {
         p.iterations = static_cast<size_t>(iterations);
         p.max_cap = 256;
         return p;
+    }
+
+    Camera make_test_camera() {
+        const std::vector<float> R_data = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+        const std::vector<float> T_data = {0, 0, 4};
+        auto R = Tensor::from_blob(const_cast<float*>(R_data.data()),
+                                   {3, 3}, Device::CPU, DataType::Float32)
+                     .to(Device::CUDA);
+        auto T = Tensor::from_blob(const_cast<float*>(T_data.data()),
+                                   {3}, Device::CPU, DataType::Float32)
+                     .to(Device::CUDA);
+        return Camera(R, T,
+                      /*fx=*/600.0f, /*fy=*/600.0f,
+                      /*cx=*/320.0f, /*cy=*/240.0f,
+                      Tensor(), Tensor(),
+                      CameraModelType::PINHOLE,
+                      /*image_name=*/"test_cam",
+                      /*image_path=*/"",
+                      /*mask_path=*/std::filesystem::path{},
+                      /*camera_width=*/640, /*camera_height=*/480,
+                      /*uid=*/0);
     }
 
 } // namespace
@@ -180,4 +204,62 @@ TEST(TideStrategyTest, RegisteredInFactory) {
     ASSERT_TRUE(created.has_value()) << (created ? "" : created.error());
     ASSERT_NE(created.value(), nullptr);
     EXPECT_STREQ(created.value()->strategy_type(), "tide");
+}
+
+// --- Phase 3.5.1: IStrategy::pre_forward callback ------------------------
+//
+// 3.5.1 wires the new per-iteration camera-aware hook into IStrategy and
+// TideStrategy. The body of TideStrategy::pre_forward is intentionally empty
+// in 3.5.1 (frustum-driven block activation lands in 3.5.2); these tests
+// pin the contract that the callback exists, can be invoked safely many
+// times, dispatches polymorphically through IStrategy, and does not perturb
+// strategy state.
+
+TEST(TideStrategyTest, PreForwardIsCallableBeforeInitialize) {
+    SKIP_IF_NO_CUDA();
+    auto splat = make_test_splat_data();
+    TideStrategy strategy(splat);
+    auto cam = make_test_camera();
+    // Calling pre_forward on a not-yet-initialized strategy must not crash.
+    // 3.5.2 will guard against use-before-initialize internally; in 3.5.1
+    // the body is empty so any inputs are valid.
+    EXPECT_NO_THROW(strategy.pre_forward(0, cam));
+    EXPECT_EQ(strategy.soa_capacity_gaussians(), 0u);
+}
+
+TEST(TideStrategyTest, PreForwardIsNoOpAfterInitializeWithoutWorkingSet) {
+    SKIP_IF_NO_CUDA();
+    constexpr int kN = 32;
+    auto splat = make_test_splat_data(kN, /*sh_degree=*/2);
+    TideStrategy strategy(splat);
+    strategy.initialize(make_opt_params());
+
+    const std::size_t cap_before = strategy.soa_capacity_gaussians();
+    const std::size_t bytes_before = strategy.soa_scratch_bytes();
+    ASSERT_GT(cap_before, 0u);
+
+    auto cam = make_test_camera();
+    // Call many times across a synthetic iteration range; nothing should
+    // change about the strategy's resident state.
+    for (int iter = 0; iter < 16; ++iter) {
+        ASSERT_NO_THROW(strategy.pre_forward(iter, cam));
+    }
+    EXPECT_EQ(strategy.soa_capacity_gaussians(), cap_before);
+    EXPECT_EQ(strategy.soa_scratch_bytes(), bytes_before);
+    EXPECT_EQ(strategy.get_working_set(), nullptr);
+}
+
+TEST(TideStrategyTest, PreForwardDispatchesViaIStrategyBasePointer) {
+    SKIP_IF_NO_CUDA();
+    auto splat = make_test_splat_data();
+    auto strategy = std::make_unique<TideStrategy>(splat);
+    strategy->initialize(make_opt_params());
+
+    IStrategy* base = strategy.get();
+    auto cam = make_test_camera();
+    // Virtual dispatch must reach TideStrategy::pre_forward without throwing
+    // even though the default IStrategy::pre_forward is a no-op too — this
+    // pins the override is wired correctly.
+    EXPECT_NO_THROW(base->pre_forward(0, cam));
+    EXPECT_NO_THROW(base->pre_forward(42, cam));
 }
