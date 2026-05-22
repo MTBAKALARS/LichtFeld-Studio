@@ -63,6 +63,7 @@ namespace {
                 "\nSUBCOMMANDS:\n"
                 "convert -- Convert between .ply, .sog, .spz, .usd/.usda/.usdc, .html\n"
                 "plugin -- Manage plugins (create, check, list)\n"
+                "tide-bake -- Bake a .ply into a Tide BlockStore on disk (Phase 3.4b)\n"
                 "\n"
                 "Run '<subcommand> --help' for details.\n"
                 "\n"
@@ -709,7 +710,7 @@ lfs::core::args::parse_args_and_params(int argc, const char* const argv[]) {
     auto params = std::make_unique<lfs::core::param::TrainingParameters>();
     auto args = convert_args(argc, argv);
 
-    if (args.size() >= 2 && !args[1].starts_with('-') && args[1] != "convert" && args[1] != "plugin") {
+    if (args.size() >= 2 && !args[1].starts_with('-') && args[1] != "convert" && args[1] != "plugin" && args[1] != "tide-bake") {
         const std::filesystem::path p = lfs::core::utf8_to_path(args[1]);
         std::error_code ec;
         if (std::filesystem::exists(p, ec))
@@ -815,6 +816,53 @@ lfs::core::args::parse_args(const int argc, const char* const argv[]) {
 
         if (arg1 == "convert") {
             // Handle convert subcommand below
+        } else if (arg1 == "tide-bake") {
+            // tide-bake <input.ply> <output_dir> [--block-size N] [--overwrite]
+            TideBakeMode mode;
+            std::vector<std::string> positional;
+            for (int i = 2; i < argc; ++i) {
+                const std::string_view a = argv[i];
+                if (a == "-h" || a == "--help") {
+                    std::print(R"(Usage: LichtFeld-Studio tide-bake <input.ply> <output_dir> [options]
+
+Bake an existing .ply into a Tide BlockStore on disk. The output directory
+will be created if missing and populated with the BlockStore base segment
+plus index file. Pass the resulting directory to --tide-store when training.
+
+Options:
+  --block-size N   Override default block size in Gaussians (must be power of 2)
+  -y, --overwrite  Overwrite existing files in <output_dir> without prompting
+)");
+                    return HelpMode{};
+                } else if (a == "--overwrite" || a == "-y") {
+                    mode.overwrite = true;
+                } else if (a.starts_with("--block-size=")) {
+                    try {
+                        mode.block_size = std::stoul(std::string(a.substr(std::string_view("--block-size=").size())));
+                    } catch (const std::exception& e) {
+                        return std::unexpected(std::format("Invalid --block-size value: {}", e.what()));
+                    }
+                } else if (a == "--block-size") {
+                    if (i + 1 >= argc) {
+                        return std::unexpected("--block-size requires a value");
+                    }
+                    try {
+                        mode.block_size = std::stoul(argv[++i]);
+                    } catch (const std::exception& e) {
+                        return std::unexpected(std::format("Invalid --block-size value: {}", e.what()));
+                    }
+                } else if (a.starts_with('-')) {
+                    return std::unexpected(std::format("Unknown tide-bake option: {}", a));
+                } else {
+                    positional.emplace_back(a);
+                }
+            }
+            if (positional.size() != 2) {
+                return std::unexpected("Usage: LichtFeld-Studio tide-bake <input.ply> <output_dir> [options]");
+            }
+            mode.ply_path = lfs::core::utf8_to_path(positional[0]);
+            mode.out_dir = lfs::core::utf8_to_path(positional[1]);
+            return mode;
         } else if (arg1 == "plugin") {
             if (argc < 3) {
                 return std::unexpected("Usage: LichtFeld-Studio plugin <create|check|list> [name]");

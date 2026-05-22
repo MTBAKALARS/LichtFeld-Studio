@@ -379,6 +379,7 @@ add_executable(${PROJECT_NAME}
     src/app/mcp_ui_registry_tools.cpp
     src/app/converter.cpp
     src/app/splash_screen.cpp
+    src/app/tide_baker.cpp
     resources/lichtfeld-studio.rc
 )
 
