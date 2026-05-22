@@ -202,6 +202,19 @@ namespace lfs::training {
                                    std::vector<std::size_t>& out_resident,
                                    bool& out_used_lru);
 
+        // Phase 3.5.7 fix: unpack active WorkingSet AOS blocks into the d_*
+        // SOA scratch buffers that back the rendering SplatData view. Must
+        // be called BEFORE `fast_rasterize_forward` reads `get_model()`,
+        // because trainer.cpp calls `pre_step` (the original unpack site)
+        // AFTER render. Without this hook the view-backed SplatData starts
+        // zero-filled at init (see initialize() bootstrap-skip when WS is
+        // attached) and the first render returns 0 visible primitives,
+        // causing trainer.cpp:2459 to early-return forever (tiles_processed
+        // == 0). Called from pre_forward after every load_and_activate /
+        // wait_and_activate that brings new data into the WS. Idempotent
+        // and cheap (one kernel launch per active block).
+        void unpack_active_data_to_soa_();
+
         struct Impl;
         std::unique_ptr<Impl> impl_;
     };

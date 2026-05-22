@@ -597,6 +597,9 @@ namespace lfs::training {
                 impl_->last_loaded_ids = impl_->resident_scratch;
                 impl_->last_pre_forward_loaded = true;
                 ++impl_->prefetch_stats.prefetch_hits;
+                // Phase 3.5.7 fix: populate d_* SOA scratch from the freshly
+                // activated WS so the immediate render sees real Gaussians.
+                unpack_active_data_to_soa_();
                 return;
             }
             // Mismatch: GPU now holds `staged`, but we want `resident_scratch`.
@@ -620,6 +623,11 @@ namespace lfs::training {
         impl_->last_loaded_ids = impl_->resident_scratch;
         impl_->last_pre_forward_loaded = true;
         ++impl_->prefetch_stats.sync_loads;
+        // Phase 3.5.7 fix: populate d_* SOA scratch from the freshly loaded
+        // WS so the immediate render sees real Gaussians (without this the
+        // first render reads zero-initialized d_* and tiles_processed==0
+        // triggers an early-return at trainer.cpp:2459).
+        unpack_active_data_to_soa_();
     }
 
     void TideStrategy::prefetch_next(int next_iter, const lfs::core::Camera& next_cam) {
@@ -758,6 +766,67 @@ namespace lfs::training {
         }
 
         std::sort(out_resident.begin(), out_resident.end());
+    }
+
+    void TideStrategy::unpack_active_data_to_soa_() {
+        // Phase 3.5.7 fix: data-only AOS→SOA unpack so the rendering
+        // SplatData view sees real Gaussians before fast_rasterize_forward
+        // runs. Mirrors the data path of pre_step() but skips the moments
+        // unpack (moments are only needed before step()). See header for
+        // why this is needed.
+        if (!impl_->working_set) {
+            return;
+        }
+        const std::size_t active_n = impl_->working_set->active_gaussian_count();
+        if (active_n == 0) {
+            return;
+        }
+        const std::size_t n = std::min(active_n, impl_->soa_capacity);
+        const bool moments_enabled = impl_->working_set->moments_bytes_per_block() > 0;
+
+        if (!moments_enabled) {
+            // Legacy v1 bulk path: slot_bytes == bytes_per_block, contiguous AOS.
+            const auto* aos = static_cast<const float*>(impl_->working_set->device_buffer());
+            if (aos == nullptr) {
+                throw std::runtime_error(
+                    "TideStrategy::unpack_active_data_to_soa_: WorkingSet has no active device buffer");
+            }
+            tide::SoaViews views{
+                impl_->d_means, impl_->d_scaling, impl_->d_rotation,
+                impl_->d_opacity, impl_->d_sh0, impl_->d_shN,
+                n, impl_->shN_floats};
+            const int rc = tide::aos_to_soa(aos, views, /*stream=*/nullptr);
+            if (rc != 0) {
+                throw std::runtime_error(
+                    "TideStrategy::unpack_active_data_to_soa_: aos_to_soa launch failed: " +
+                    std::string(cudaGetErrorString(static_cast<cudaError_t>(rc))));
+            }
+            return;
+        }
+
+        // v2 per-slot path: stride includes moments interleaving.
+        const auto* base = static_cast<const std::byte*>(impl_->working_set->device_buffer());
+        if (base == nullptr) {
+            throw std::runtime_error(
+                "TideStrategy::unpack_active_data_to_soa_: WorkingSet has no active device buffer");
+        }
+        const std::size_t slot_bytes = impl_->working_set->slot_bytes();
+        const std::size_t g = impl_->g_per_block;
+        const auto slices = impl_->working_set->active_slices();
+        for (const auto& s : slices) {
+            const float* slot_data = reinterpret_cast<const float*>(base + s.local_index * slot_bytes);
+            tide::SoaViews dview = per_block_data_views(
+                impl_->d_means, impl_->d_scaling, impl_->d_rotation,
+                impl_->d_opacity, impl_->d_sh0, impl_->d_shN,
+                s.local_index, g, impl_->shN_floats);
+            const int rc = tide::aos_to_soa(slot_data, dview, /*stream=*/nullptr);
+            if (rc != 0) {
+                throw std::runtime_error(
+                    "TideStrategy::unpack_active_data_to_soa_: per-block aos_to_soa launch failed at slot " +
+                    std::to_string(s.local_index) + ": " +
+                    std::string(cudaGetErrorString(static_cast<cudaError_t>(rc))));
+            }
+        }
     }
 
     void TideStrategy::pre_step(int /*iter*/, RenderOutput& /*render_output*/) {
