@@ -16,7 +16,10 @@
 
 #include "core/logger.hpp"
 #include "strategies/strategy_utils.hpp"
+#include "tide/aos_soa_repack.hpp"
+#include "tide/working_set.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -26,6 +29,7 @@
 #include <ostream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace lfs::training {
 
@@ -66,8 +70,16 @@ namespace lfs::training {
 
     struct TideStrategy::Impl {
         // Bootstrap source — the SplatData handed to the constructor. We only
-        // read from it during initialize() to seed the SOA scratch.
+        // read from it during initialize() to seed the SOA scratch (if no
+        // WorkingSet is attached) and to pick up sh_degree / scene_scale.
         lfs::core::SplatData* placeholder = nullptr;
+
+        // Optional WorkingSet. When attached BEFORE initialize, SOA scratch is
+        // sized to `capacity_blocks * gaussians_per_block` and pre_step / step
+        // use the Tide-resident path. When null, the strategy degrades to the
+        // Phase 3.2b shell (standard AdamOptimizer over the view-backed
+        // SplatData).
+        std::shared_ptr<tide::WorkingSet> working_set;
 
         // Cached optimization parameters (set in initialize / via
         // set_optimization_params).
@@ -149,12 +161,29 @@ namespace lfs::training {
 
         impl_->params = std::make_unique<const param::OptimizationParameters>(optimParams);
 
-        // Sizing. Phase 3.2b: take the placeholder's Gaussian count as the
-        // working-set size. Phase 3.3 will switch to capacity_blocks *
-        // block_size.
-        const std::size_t n = impl_->placeholder->size();
-        if (n == 0) {
-            throw std::runtime_error("TideStrategy::initialize: placeholder has 0 Gaussians");
+        // Sizing. If a WorkingSet is attached, size SOA scratch to its full
+        // capacity (capacity_blocks * gaussians_per_block) so SOA buffers can
+        // hold the largest possible resident set. Otherwise (Phase 3.2b shell)
+        // size to the placeholder's Gaussian count.
+        std::size_t n = 0;
+        if (impl_->working_set) {
+            const auto& cfg = impl_->working_set->config();
+            if (cfg.bytes_per_block == 0 || cfg.bytes_per_block % tide::kAosBytesPerGaussian != 0) {
+                throw std::runtime_error(
+                    "TideStrategy::initialize: WorkingSet bytes_per_block (" +
+                    std::to_string(cfg.bytes_per_block) + ") is not a multiple of " +
+                    std::to_string(tide::kAosBytesPerGaussian));
+            }
+            const std::size_t g_per_block = cfg.bytes_per_block / tide::kAosBytesPerGaussian;
+            n = cfg.capacity_blocks * g_per_block;
+            if (n == 0) {
+                throw std::runtime_error("TideStrategy::initialize: WorkingSet has 0 capacity");
+            }
+        } else {
+            n = impl_->placeholder->size();
+            if (n == 0) {
+                throw std::runtime_error("TideStrategy::initialize: placeholder has 0 Gaussians");
+            }
         }
         impl_->soa_capacity = n;
         impl_->sh_degree = impl_->placeholder->get_max_sh_degree();
@@ -170,39 +199,62 @@ namespace lfs::training {
         impl_->scratch_bytes = sizeof(float) * n *
                                (3 + 3 + 4 + 1 + 3 + impl_->shN_floats);
 
-        LOG_DEBUG("TideStrategy: allocated {} bytes of SOA scratch for {} Gaussians (SH degree {}, shN floats/g {})",
-                  impl_->scratch_bytes, n, impl_->sh_degree, impl_->shN_floats);
+        LOG_DEBUG("TideStrategy: allocated {} bytes of SOA scratch for {} Gaussians (SH degree {}, shN floats/g {}, working_set={})",
+                  impl_->scratch_bytes, n, impl_->sh_degree, impl_->shN_floats,
+                  impl_->working_set ? "attached" : "none");
 
-        // Bootstrap from placeholder so the view contains valid data.
-        auto copy_from_placeholder = [n](float* dst, const Tensor& src, std::size_t expected_floats, const char* name) {
-            if (!src.is_valid() || src.numel() == 0) {
-                if (expected_floats == 0)
-                    return;
-                throw std::runtime_error(
-                    std::string("TideStrategy::initialize: placeholder tensor '") +
-                    name + "' is empty but expected " + std::to_string(expected_floats) + " floats");
+        // Bootstrap. When a WorkingSet is attached the SOA scratch will be
+        // populated by pre_step()'s aos_to_soa() on the first iteration, so a
+        // device-side zero-fill is sufficient (avoids reading garbage if
+        // someone inspects the SplatData before the first pre_step). Otherwise
+        // copy the placeholder's data so the view is immediately valid.
+        if (impl_->working_set) {
+            const std::array<std::pair<float*, std::size_t>, 6> zero_targets{{
+                {impl_->d_means, n * 3},
+                {impl_->d_scaling, n * 3},
+                {impl_->d_rotation, n * 4},
+                {impl_->d_opacity, n * 1},
+                {impl_->d_sh0, n * 3},
+                {impl_->d_shN, n * impl_->shN_floats},
+            }};
+            for (const auto& [ptr, count] : zero_targets) {
+                if (ptr == nullptr || count == 0) continue;
+                const auto err = cudaMemset(ptr, 0, count * sizeof(float));
+                if (err != cudaSuccess) {
+                    throw std::runtime_error(cuda_err("cudaMemset(soa zero)", err));
+                }
             }
-            if (src.numel() != expected_floats) {
-                throw std::runtime_error(
-                    std::string("TideStrategy::initialize: placeholder tensor '") +
-                    name + "' has " + std::to_string(src.numel()) +
-                    " floats, expected " + std::to_string(expected_floats) +
-                    " (n=" + std::to_string(n) + ")");
-            }
-            const auto err = cudaMemcpy(dst, src.ptr<float>(), expected_floats * sizeof(float),
-                                        cudaMemcpyDeviceToDevice);
-            if (err != cudaSuccess) {
-                throw std::runtime_error(cuda_err("cudaMemcpy(bootstrap)", err));
-            }
-        };
+        } else {
+            auto copy_from_placeholder = [n](float* dst, const Tensor& src, std::size_t expected_floats, const char* name) {
+                if (!src.is_valid() || src.numel() == 0) {
+                    if (expected_floats == 0)
+                        return;
+                    throw std::runtime_error(
+                        std::string("TideStrategy::initialize: placeholder tensor '") +
+                        name + "' is empty but expected " + std::to_string(expected_floats) + " floats");
+                }
+                if (src.numel() != expected_floats) {
+                    throw std::runtime_error(
+                        std::string("TideStrategy::initialize: placeholder tensor '") +
+                        name + "' has " + std::to_string(src.numel()) +
+                        " floats, expected " + std::to_string(expected_floats) +
+                        " (n=" + std::to_string(n) + ")");
+                }
+                const auto err = cudaMemcpy(dst, src.ptr<float>(), expected_floats * sizeof(float),
+                                            cudaMemcpyDeviceToDevice);
+                if (err != cudaSuccess) {
+                    throw std::runtime_error(cuda_err("cudaMemcpy(bootstrap)", err));
+                }
+            };
 
-        copy_from_placeholder(impl_->d_means, impl_->placeholder->means_raw(), n * 3, "means");
-        copy_from_placeholder(impl_->d_scaling, impl_->placeholder->scaling_raw(), n * 3, "scaling");
-        copy_from_placeholder(impl_->d_rotation, impl_->placeholder->rotation_raw(), n * 4, "rotation");
-        copy_from_placeholder(impl_->d_opacity, impl_->placeholder->opacity_raw(), n * 1, "opacity");
-        copy_from_placeholder(impl_->d_sh0, impl_->placeholder->sh0_raw(), n * 3, "sh0");
-        if (impl_->d_shN != nullptr) {
-            copy_from_placeholder(impl_->d_shN, impl_->placeholder->shN_raw(), n * impl_->shN_floats, "shN");
+            copy_from_placeholder(impl_->d_means, impl_->placeholder->means_raw(), n * 3, "means");
+            copy_from_placeholder(impl_->d_scaling, impl_->placeholder->scaling_raw(), n * 3, "scaling");
+            copy_from_placeholder(impl_->d_rotation, impl_->placeholder->rotation_raw(), n * 4, "rotation");
+            copy_from_placeholder(impl_->d_opacity, impl_->placeholder->opacity_raw(), n * 1, "opacity");
+            copy_from_placeholder(impl_->d_sh0, impl_->placeholder->sh0_raw(), n * 3, "sh0");
+            if (impl_->d_shN != nullptr) {
+                copy_from_placeholder(impl_->d_shN, impl_->placeholder->shN_raw(), n * impl_->shN_floats, "shN");
+            }
         }
 
         // Build the view-backed SplatData. from_blob returns a non-owning
@@ -272,20 +324,53 @@ namespace lfs::training {
         }
         impl_->resident_adam = std::move(*resident);
 
-        LOG_INFO("TideStrategy initialized (shell): {} Gaussians, SH degree {}, view-backed SplatData",
-                 n, impl_->sh_degree);
+        LOG_INFO("TideStrategy initialized: {} Gaussians, SH degree {}, view-backed SplatData, working_set={}",
+                 n, impl_->sh_degree, impl_->working_set ? "attached" : "none");
     }
 
     // ----------------------------------------------------------------------
 
     void TideStrategy::pre_step(int /*iter*/, RenderOutput& /*render_output*/) {
-        // Phase 3.2b: no-op. Phase 3.3 will call
-        // working_set_->wait_and_activate() + aos_to_soa(d_*) here.
+        if (!impl_->working_set) {
+            // Phase 3.2b shell path: no working set, SplatData view was
+            // bootstrapped from the placeholder in initialize().
+            return;
+        }
+
+        // Phase 3.3a: unpack the active AOS device buffer into SOA scratch.
+        // Active gaussian count may be < soa_capacity if the active set is
+        // partial; aos_to_soa only touches the first `num_gaussians` records.
+        const std::size_t active_n = impl_->working_set->active_gaussian_count();
+        if (active_n == 0) {
+            LOG_WARN("TideStrategy::pre_step: working set has 0 active Gaussians; skipping unpack");
+            return;
+        }
+        if (active_n > impl_->soa_capacity) {
+            LOG_ERROR("TideStrategy::pre_step: active Gaussian count {} exceeds SOA capacity {}; clamping",
+                      active_n, impl_->soa_capacity);
+        }
+        const std::size_t n = std::min(active_n, impl_->soa_capacity);
+
+        const auto* aos = static_cast<const float*>(impl_->working_set->device_buffer());
+        if (aos == nullptr) {
+            throw std::runtime_error("TideStrategy::pre_step: WorkingSet has no active device buffer");
+        }
+
+        tide::SoaViews views{
+            impl_->d_means, impl_->d_scaling, impl_->d_rotation,
+            impl_->d_opacity, impl_->d_sh0, impl_->d_shN,
+            n, impl_->shN_floats};
+        const int rc = tide::aos_to_soa(aos, views, /*stream=*/nullptr);
+        if (rc != 0) {
+            throw std::runtime_error(
+                "TideStrategy::pre_step: aos_to_soa launch failed: " +
+                std::string(cudaGetErrorString(static_cast<cudaError_t>(rc))));
+        }
     }
 
     void TideStrategy::post_backward(int /*iter*/, RenderOutput& /*render_output*/) {
-        // Phase 3.2b: no-op. Phase 3.3 will flag dirty blocks here so the
-        // next prefetch knows what to write back.
+        // Phase 3.3a: no-op. Phase 3.3b will flag dirty blocks here so the
+        // next prefetch knows what to write back to TieredCache / BlockStore.
     }
 
     void TideStrategy::step(int iter) {
@@ -296,10 +381,75 @@ namespace lfs::training {
         if (iter >= static_cast<int>(impl_->params->iterations)) {
             return;
         }
-        // Phase 3.2b: equivalent to MCMC::step's optimizer dance. Phase 3.3
-        // will replace .step(iter) with TideResidentAdam::step over the SOA
-        // scratch and kick off WorkingSet::prefetch(next_blocks).
-        impl_->optimizer->step(iter);
+
+        if (!impl_->working_set) {
+            // Phase 3.2b shell path: drive the held AdamOptimizer directly.
+            impl_->optimizer->step(iter);
+            impl_->optimizer->zero_grad(iter);
+            impl_->scheduler->step();
+            return;
+        }
+
+        // Phase 3.3a: route the actual Adam step through TideResidentAdam over
+        // the SOA scratch, then repack SOA back into the active AOS buffer.
+        // The held AdamOptimizer is only used as a grad-buffer host (its
+        // `step()` is intentionally NOT called on this path).
+        const std::size_t active_n = impl_->working_set->active_gaussian_count();
+        if (active_n == 0) {
+            LOG_WARN("TideStrategy::step: working set has 0 active Gaussians; skipping");
+            return;
+        }
+        const std::size_t n = std::min(active_n, impl_->soa_capacity);
+
+        struct ParamRoute {
+            ParamType type;
+            float* param_ptr;
+            std::size_t num_elements;
+        };
+        const std::array<ParamRoute, 6> routes{{
+            {ParamType::Means,    impl_->d_means,    n * 3},
+            {ParamType::Sh0,      impl_->d_sh0,      n * 3},
+            {ParamType::ShN,      impl_->d_shN,      n * impl_->shN_floats},
+            {ParamType::Scaling,  impl_->d_scaling,  n * 3},
+            {ParamType::Rotation, impl_->d_rotation, n * 4},
+            {ParamType::Opacity,  impl_->d_opacity,  n * 1},
+        }};
+        for (const auto& r : routes) {
+            if (r.param_ptr == nullptr || r.num_elements == 0) continue;
+            auto& grad_tensor = impl_->optimizer->get_grad(r.type);
+            if (!grad_tensor.is_valid()) {
+                LOG_WARN("TideStrategy::step: grad tensor for ParamType {} is invalid; skipping", static_cast<int>(r.type));
+                continue;
+            }
+            const auto result = impl_->resident_adam->step(
+                r.type, r.param_ptr, grad_tensor.ptr<float>(),
+                r.num_elements, iter);
+            if (!result.has_value()) {
+                throw std::runtime_error(
+                    "TideStrategy::step: TideResidentAdam::step failed for ParamType " +
+                    std::to_string(static_cast<int>(r.type)) + ": " + result.error());
+            }
+        }
+
+        // Repack SOA -> AOS so the resident bytes in the active buffer
+        // reflect the post-Adam parameters. Phase 3.3b will mark these blocks
+        // dirty so the next prefetch writes them back to TieredCache.
+        auto* aos = static_cast<float*>(impl_->working_set->mutable_device_buffer());
+        if (aos == nullptr) {
+            throw std::runtime_error("TideStrategy::step: WorkingSet has no mutable device buffer");
+        }
+        tide::SoaViews views{
+            impl_->d_means, impl_->d_scaling, impl_->d_rotation,
+            impl_->d_opacity, impl_->d_sh0, impl_->d_shN,
+            n, impl_->shN_floats};
+        const int rc = tide::soa_to_aos(views, aos, /*stream=*/nullptr);
+        if (rc != 0) {
+            throw std::runtime_error(
+                "TideStrategy::step: soa_to_aos launch failed: " +
+                std::string(cudaGetErrorString(static_cast<cudaError_t>(rc))));
+        }
+
+        // Clear grads + advance scheduler (matching MCMC::step semantics).
         impl_->optimizer->zero_grad(iter);
         impl_->scheduler->step();
     }
@@ -394,6 +544,23 @@ namespace lfs::training {
 
     const tide::TideResidentAdam* TideStrategy::get_resident_adam() const noexcept {
         return impl_ ? impl_->resident_adam.get() : nullptr;
+    }
+
+    tide::WorkingSet* TideStrategy::get_working_set() noexcept {
+        return impl_ ? impl_->working_set.get() : nullptr;
+    }
+
+    void TideStrategy::set_working_set(std::shared_ptr<tide::WorkingSet> working_set) {
+        if (impl_->splat_view != nullptr) {
+            // SOA scratch sizing is decided in initialize(). Attaching a
+            // WorkingSet afterwards would mean the SOA capacity no longer
+            // matches the WorkingSet's capacity; reject explicitly rather
+            // than silently mis-sizing.
+            throw std::runtime_error(
+                "TideStrategy::set_working_set: must be called BEFORE initialize() "
+                "(SOA scratch is already sized)");
+        }
+        impl_->working_set = std::move(working_set);
     }
 
 } // namespace lfs::training

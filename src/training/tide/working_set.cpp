@@ -381,6 +381,10 @@ namespace lfs::training::tide {
         return impl_ ? impl_->device_buffer[impl_->active_idx] : nullptr;
     }
 
+    void* WorkingSet::mutable_device_buffer() noexcept {
+        return impl_ ? impl_->device_buffer[impl_->active_idx] : nullptr;
+    }
+
     std::span<const WorkingSet::BlockSlice> WorkingSet::active_slices() const noexcept {
         if (!impl_) return {};
         return std::span<const BlockSlice>(impl_->active_slices_);

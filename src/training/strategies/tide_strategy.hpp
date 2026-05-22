@@ -11,6 +11,7 @@
 #include "optimizer/adam_optimizer.hpp"
 #include "optimizer/scheduler.hpp"
 #include "optimizer/tide_resident_adam.hpp"
+#include "tide/working_set.hpp"
 
 #include <cstddef>
 #include <memory>
@@ -58,6 +59,17 @@ namespace lfs::training {
         TideStrategy(TideStrategy&&) = delete;
         TideStrategy& operator=(TideStrategy&&) = delete;
 
+        /// Attach a WorkingSet. Must be called BEFORE @ref initialize so that
+        /// SOA scratch is sized to `capacity_blocks * gaussians_per_block`
+        /// rather than the placeholder SplatData size. When attached:
+        ///  - `pre_step` unpacks the active AOS device buffer into SOA scratch
+        ///    via @ref tide::aos_to_soa.
+        ///  - `step` invokes @ref tide::TideResidentAdam per ParamType and
+        ///    repacks SOA back into the active buffer via @ref tide::soa_to_aos.
+        /// When NOT attached the strategy falls back to the Phase 3.2b shell
+        /// behavior (standard AdamOptimizer over the view-backed SplatData).
+        void set_working_set(std::shared_ptr<tide::WorkingSet> working_set);
+
         // IStrategy interface ----------------------------------------------
         void initialize(const lfs::core::param::OptimizationParameters& optimParams) override;
         void pre_step(int iter, RenderOutput& render_output) override;
@@ -88,6 +100,8 @@ namespace lfs::training {
         std::size_t soa_scratch_bytes() const noexcept;
         /// Access the underlying Tide-resident Adam (testing only).
         const tide::TideResidentAdam* get_resident_adam() const noexcept;
+        /// Access the attached WorkingSet (may be null).
+        tide::WorkingSet* get_working_set() noexcept;
 
     private:
         struct Impl;

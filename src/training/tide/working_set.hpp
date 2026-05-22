@@ -154,6 +154,12 @@ namespace lfs::training::tide {
         /// Device pointer to the contiguous packed buffer of all resident blocks (raw bytes).
         const void* device_buffer() const noexcept;
 
+        /// Mutable device pointer to the same buffer as @ref device_buffer.
+        /// Used by writers (e.g. Tide's SOA→AOS repack after an optimizer step)
+        /// that need to update the resident bytes in place before the next prefetch.
+        /// Callers must NOT outlive the next @ref wait_and_activate() call.
+        void* mutable_device_buffer() noexcept;
+
         /// Per-resident-block slice table, in the order the rasterizer should see them.
         std::span<const BlockSlice> active_slices() const noexcept;
 
