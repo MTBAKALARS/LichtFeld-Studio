@@ -119,6 +119,7 @@ set(TEST_FILES
     test_tide_strategy_moments.cpp
     test_tide_strategy_lru.cpp
     test_tide_strategy_prefetch.cpp
+    test_tide_strategy_pipelined_loop.cpp
     test_tide_runtime.cpp
     test_tide_bake_args.cpp
     test_loss_gradients.cpp

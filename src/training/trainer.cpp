@@ -2824,6 +2824,12 @@ namespace lfs::training {
             setActiveImageLoader(train_dataloader->get_loader_shared());
             strategy_->set_image_loader(train_dataloader->get_loader());
 
+            // Phase 3.5.6b: clear any prefetch-peek slot left over from a
+            // previous training run on this Trainer instance. The slot is
+            // tied to the dataloader; a fresh dataloader means the stashed
+            // example (if any) is no longer valid.
+            pending_pipelined_example_.reset();
+
             if (memory_breakdown_enabled_ && !memory_breakdown_logged_train_setup_) {
                 const auto snapshot = capture_vram_snapshot(true);
                 log_vram_snapshot("after_dataloader_setup", snapshot);
@@ -2856,7 +2862,17 @@ namespace lfs::training {
 
                 lfs::core::Camera* cam = nullptr;
                 lfs::core::Tensor gt_image;
-                auto example_opt = train_dataloader->next();
+                // Phase 3.5.6b: consume the prefetch-peek slot stashed by the
+                // previous iteration if present, otherwise pull synchronously
+                // from the dataloader (cold start, or the previous peek
+                // returned nullopt).
+                std::optional<CameraExample> example_opt;
+                if (pending_pipelined_example_.has_value()) {
+                    example_opt = std::move(pending_pipelined_example_);
+                    pending_pipelined_example_.reset();
+                } else {
+                    example_opt = train_dataloader->next();
+                }
                 if (!example_opt) {
                     LOG_ERROR("DataLoader returned nullopt unexpectedly");
                     break;
@@ -2937,11 +2953,41 @@ namespace lfs::training {
                     }
                 }
 
+                // Phase 3.5.6b: pipelined prefetch peek.
+                //
+                // Pull the next iteration's example from the dataloader now,
+                // hand its camera to the strategy so it can stage the matching
+                // resident set asynchronously (Tide), and stash the example in
+                // pending_pipelined_example_ so the top of the next iteration
+                // consumes it directly instead of calling dataloader->next()
+                // again.
+                //
+                // IStrategy::prefetch_next has a no-op default, so non-Tide
+                // strategies see only the cost of the peek itself (which is
+                // useful anyway: it lets the dataloader keep its hot/cold
+                // queues primed one slot ahead). On peek failure or missing
+                // camera we leave pending_pipelined_example_ empty and the
+                // next iteration falls back to the synchronous dataloader
+                // path; the strategy will sync-load on cache miss as before.
+                if (iter + 1 <= params_.optimization.iterations &&
+                    !pending_pipelined_example_.has_value() &&
+                    !stop_token.stop_requested() && !stop_requested_.load()) {
+                    auto peek_opt = train_dataloader->next();
+                    if (peek_opt && peek_opt->data.camera) {
+                        strategy_->prefetch_next(iter + 1, *peek_opt->data.camera);
+                        pending_pipelined_example_ = std::move(peek_opt);
+                    }
+                }
+
                 ++iter;
             }
 
             clearActiveImageLoader();
             active_image_loader_guard.release();
+
+            // Phase 3.5.6b: drop any stashed peek so its Tensor releases its
+            // device memory back to the pool before the final save runs.
+            pending_pipelined_example_.reset();
 
             // Ensure callback is finished before final save
             if (callback_busy_.load()) {

@@ -330,6 +330,16 @@ namespace lfs::training {
         // Pre-loaded mask from pipelined dataloader (used in train_step)
         lfs::core::Tensor pipelined_mask_;
 
+        // Phase 3.5.6b: pipelined-prefetch peek. At end of iter N the training
+        // loop peeks the dataloader for iter N+1's example, stashes it here,
+        // and calls `strategy_->prefetch_next(N+1, *cam)` to overlap the
+        // WorkingSet H2D stage with the rest of iter N's tail work. At start
+        // of iter N+1 the loop consumes from this slot instead of calling
+        // `dataloader->next()`. Empty (nullopt) means the next iteration must
+        // pull from the dataloader synchronously (cold start, end-of-loop, or
+        // peek failed). Cleared each time a new dataloader is set up.
+        std::optional<CameraExample> pending_pipelined_example_;
+
         // Bilateral grid for appearance modeling (optional)
         std::unique_ptr<BilateralGrid> bilateral_grid_;
 
