@@ -241,6 +241,16 @@ namespace lfs::training {
         // Equals false for the iota-all-blocks fast path.
         bool last_pre_forward_used_lru = false;
 
+        // Phase 3.5.6 pipelined prefetch state.
+        // `pending_prefetch_ids` mirrors the block_id list passed to
+        // `WorkingSet::prefetch` by the most recent `prefetch_next` call. It
+        // is cleared whenever pre_forward consumes (or drains) the staged
+        // prefetch. `working_set->prefetch_pending()` is the source of truth
+        // for whether an async copy is in flight; this vector is the predicted
+        // set used to decide hit vs miss against `resident_scratch`.
+        std::vector<std::size_t> pending_prefetch_ids;
+        TideStrategy::PrefetchStats prefetch_stats{};
+
         void free_scratch() noexcept {
             const std::array<float**, 6> ptrs{&d_means, &d_scaling, &d_rotation,
                                               &d_opacity, &d_sh0, &d_shN};
@@ -532,14 +542,149 @@ namespace lfs::training {
             return;
         }
 
+        // 1-5. Compute resident set (helper writes to visible_scratch +
+        // resident_scratch). Phase 3.5.6 splits this out so `prefetch_next`
+        // can reuse it with its own scratch buffers.
+        bool used_lru = false;
+        compute_resident_set_(iter, cam,
+                              impl_->visible_scratch,
+                              impl_->resident_scratch,
+                              used_lru);
+
+        // Publish telemetry from the computation step.
+        impl_->last_visible_ids = impl_->visible_scratch;
+        impl_->last_pre_forward_used_lru = used_lru;
+
+        // Stamp last_used_iter for every block we are about to make resident.
+        // This includes both visible blocks AND LRU-fill blocks; the latter
+        // are "kept warm" by being resident even if not directly rendered.
+        for (auto bid : impl_->resident_scratch) {
+            impl_->block_last_used_iter[bid] = static_cast<std::int64_t>(iter);
+        }
+
+        impl_->last_pre_forward_loaded = false;
+
+        // 6. Skip the load entirely when the resident set is identical to
+        //    last time. For the all-blocks case this fires exactly once per
+        //    training run (iter 0), giving v24 perf parity with Phase 3.4c.
+        if (impl_->resident_scratch == impl_->last_loaded_ids) {
+            // A pending prefetch (issued speculatively at end of last iter)
+            // is unusable now; drain it so the WorkingSet state machine is
+            // consistent for the next prefetch_next call.
+            if (impl_->working_set->prefetch_pending()) {
+                (void)impl_->working_set->wait_and_activate();
+                impl_->pending_prefetch_ids.clear();
+            }
+            return;
+        }
+
+        // 7. Phase 3.5.6 pipelined consumption.
+        //    If a prefetch is pending we MUST consume it via wait_and_activate
+        //    (the WorkingSet contract forbids issuing a second prefetch before
+        //    the first completes). If the staged ids match resident_scratch
+        //    we are done; otherwise we drain and fall through to sync-load.
+        if (impl_->working_set->prefetch_pending()) {
+            const bool match = (impl_->pending_prefetch_ids == impl_->resident_scratch);
+            auto wr = impl_->working_set->wait_and_activate();
+            if (!wr) {
+                throw std::runtime_error(
+                    "TideStrategy::pre_forward: wait_and_activate failed at iter " +
+                    std::to_string(iter) + ": " + wr.error());
+            }
+            const auto staged = std::move(impl_->pending_prefetch_ids);
+            impl_->pending_prefetch_ids.clear();
+            if (match) {
+                impl_->last_loaded_ids = impl_->resident_scratch;
+                impl_->last_pre_forward_loaded = true;
+                ++impl_->prefetch_stats.prefetch_hits;
+                return;
+            }
+            // Mismatch: GPU now holds `staged`, but we want `resident_scratch`.
+            // Record what's actually on the device so the next equality-skip
+            // check is honest, then sync-load the correct set below.
+            impl_->last_loaded_ids = staged;
+            ++impl_->prefetch_stats.prefetch_misses;
+        }
+
+        // 8. Synchronous load. Phase 3.5.6 retains this path as the fallback
+        //    when no prefetch is pending or the prediction missed.
+        auto result = impl_->working_set->load_and_activate(
+            *impl_->cache,
+            std::span<const std::size_t>(impl_->resident_scratch.data(),
+                                         impl_->resident_scratch.size()));
+        if (!result) {
+            throw std::runtime_error(
+                "TideStrategy::pre_forward: WorkingSet::load_and_activate failed at iter " +
+                std::to_string(iter) + ": " + result.error());
+        }
+        impl_->last_loaded_ids = impl_->resident_scratch;
+        impl_->last_pre_forward_loaded = true;
+        ++impl_->prefetch_stats.sync_loads;
+    }
+
+    void TideStrategy::prefetch_next(int next_iter, const lfs::core::Camera& next_cam) {
+        // Phase 3.5.6 — speculative pipelined prefetch hook.
+        // Soft-fail at every step: if anything goes wrong the next
+        // `pre_forward` simply falls back to a synchronous load.
+        if (!impl_->working_set || !impl_->store || !impl_->cache) {
+            return;
+        }
+        // The WorkingSet contract forbids issuing a second prefetch before
+        // the first completes. If a previous prefetch is still in flight we
+        // skip this one; `pre_forward` will consume the in-flight one.
+        if (impl_->working_set->prefetch_pending()) {
+            return;
+        }
+
+        // Predict the resident set for (next_iter, next_cam) into LOCAL
+        // buffers so we do not clobber `visible_scratch` / `resident_scratch`
+        // / `last_loaded_ids` before `pre_forward` runs on the current iter.
+        std::vector<std::size_t> predicted_visible;
+        std::vector<std::size_t> predicted;
+        bool used_lru = false;
+        try {
+            compute_resident_set_(next_iter, next_cam,
+                                  predicted_visible, predicted, used_lru);
+        } catch (const std::runtime_error&) {
+            // Visible-set-exceeds-capacity or similar. Don't bring down the
+            // training loop from here; `pre_forward` will throw the same
+            // error on the matching call where the operator can see it.
+            return;
+        }
+
+        // If `predicted == last_loaded_ids`, `pre_forward` will short-circuit
+        // and skip the load anyway — issuing a prefetch would be wasted I/O.
+        if (predicted == impl_->last_loaded_ids) {
+            ++impl_->prefetch_stats.prefetch_skipped_no_change;
+            return;
+        }
+
+        auto pr = impl_->working_set->prefetch(
+            *impl_->cache,
+            std::span<const std::size_t>(predicted.data(), predicted.size()));
+        if (!pr) {
+            // Soft-fail: leave pending_prefetch_ids empty; pre_forward will
+            // see prefetch_pending() == false and sync-load.
+            return;
+        }
+        impl_->pending_prefetch_ids = std::move(predicted);
+        ++impl_->prefetch_stats.prefetches_issued;
+    }
+
+    void TideStrategy::compute_resident_set_(int iter,
+                                             const lfs::core::Camera& cam,
+                                             std::vector<std::size_t>& out_visible,
+                                             std::vector<std::size_t>& out_resident,
+                                             bool& out_used_lru) {
         // 1. Snapshot per-block bounds under one BlockStore lock acquisition.
         impl_->store->snapshot_bounds(impl_->bounds_scratch);
         const std::size_t num_blocks = impl_->bounds_scratch.size();
+        out_used_lru = false;
         if (num_blocks == 0) {
             // Empty store — nothing to do. Should not happen in practice
             // (open() rejects 0-block stores), but guard cleanly.
-            impl_->last_visible_ids.clear();
-            impl_->last_pre_forward_loaded = false;
+            out_visible.clear();
+            out_resident.clear();
             return;
         }
 
@@ -552,125 +697,67 @@ namespace lfs::training {
             std::span<const lfs::core::BlockStore::BlockBounds>(
                 impl_->bounds_scratch.data(), impl_->bounds_scratch.size()),
             std::span<const tide::FrustumCuller::Plane, 6>(impl_->planes_scratch),
-            impl_->visible_scratch);
+            out_visible);
 
-        // 4. Publish telemetry. The visible list is what the camera ACTUALLY
-        //    sees this iteration — this is the input that Phase 3.5.4 will
-        //    forward to WorkingSet, once per-block Adam moments (Phase 3.5.3)
-        //    have made variable residency safe.
-        impl_->last_visible_ids = impl_->visible_scratch;
-
-        // 5. Build the resident set we will hand to WorkingSet.
+        // 4. Build the resident set.
         //
-        // *** Phase 3.5.4 — three-mode policy ***
-        //
-        // Mode A (legacy v1, no moments): TideResidentAdam stores per-Gaussian
-        // m/v as flat arrays indexed by SOA position. Variable residency is
-        // unsafe (block_id <-> SOA position would scramble across iters), so
-        // we keep iota-all-blocks. v24 single-tile training stays on this path.
-        //
-        // Mode B (v2, store fits in capacity): no eviction needed — iota-all.
-        // This is the common "moments bake but still single-tile" path.
-        //
-        // Mode C (v2, store > capacity): the actual out-of-core path. Visible
-        // blocks are protected (must be resident); remaining slots are filled
-        // with the most-recently-used non-visible blocks (LRU). Per-block
-        // moments make this numerically safe — Phase 3.5.3e-2 wired it.
+        // Three-mode policy (Phase 3.5.4):
+        //   Mode A (v1, no moments): iota-all (variable residency unsafe).
+        //   Mode B (v2, fits): iota-all (no eviction needed).
+        //   Mode C (v2, over capacity): visible-first + LRU fill.
         const bool moments_enabled = impl_->working_set->moments_bytes_per_block() > 0;
         const std::size_t capacity = impl_->working_set->config().capacity_blocks;
-        impl_->last_pre_forward_used_lru = false;
 
         if (!moments_enabled || num_blocks <= capacity) {
-            impl_->resident_scratch.resize(num_blocks);
-            std::iota(impl_->resident_scratch.begin(), impl_->resident_scratch.end(), std::size_t{0});
-        } else {
-            // Mode C: visible-first + LRU fill.
-            impl_->last_pre_forward_used_lru = true;
-            impl_->resident_scratch.clear();
-            impl_->resident_scratch.reserve(capacity);
-
-            // Build a fast lookup for visibility membership.
-            std::unordered_set<std::size_t> visible_set(
-                impl_->visible_scratch.begin(), impl_->visible_scratch.end());
-
-            // Visible blocks ALWAYS resident — fail loudly when the visible
-            // set alone exceeds capacity (the operator must raise
-            // --tide-capacity-blocks or accept lower-quality coarser tiling;
-            // silently dropping visible blocks would produce holes in the
-            // render).
-            if (visible_set.size() > capacity) {
-                throw std::runtime_error(
-                    "TideStrategy::pre_forward: visible set size " +
-                    std::to_string(visible_set.size()) +
-                    " exceeds WorkingSet capacity " + std::to_string(capacity) +
-                    " at iter " + std::to_string(iter) +
-                    " - increase --tide-capacity-blocks");
-            }
-            for (auto vid : impl_->visible_scratch) {
-                impl_->resident_scratch.push_back(vid);
-            }
-
-            // Fill remaining slots with non-visible blocks by descending
-            // last_used_iter (most recently used first). Blocks never resident
-            // tie-break at -1, i.e. lowest priority.
-            const std::size_t remaining = capacity - visible_set.size();
-            if (remaining > 0 && num_blocks > visible_set.size()) {
-                std::vector<std::pair<std::int64_t, std::size_t>> candidates;
-                candidates.reserve(num_blocks - visible_set.size());
-                for (std::size_t bid = 0; bid < num_blocks; ++bid) {
-                    if (visible_set.count(bid)) continue;
-                    auto it = impl_->block_last_used_iter.find(bid);
-                    const std::int64_t lui = (it == impl_->block_last_used_iter.end())
-                                                 ? std::int64_t{-1}
-                                                 : it->second;
-                    candidates.emplace_back(lui, bid);
-                }
-                const std::size_t k = std::min(remaining, candidates.size());
-                if (k < candidates.size()) {
-                    // Partition top k by first (last_used_iter) desc.
-                    std::nth_element(
-                        candidates.begin(), candidates.begin() + k, candidates.end(),
-                        [](const auto& a, const auto& b) { return a.first > b.first; });
-                }
-                for (std::size_t i = 0; i < k; ++i) {
-                    impl_->resident_scratch.push_back(candidates[i].second);
-                }
-            }
-
-            // Sort for deterministic ordering + equality-skip check below.
-            std::sort(impl_->resident_scratch.begin(), impl_->resident_scratch.end());
-        }
-
-        // Stamp last_used_iter for every block we are about to make resident.
-        // This includes both visible blocks AND LRU-fill blocks; the latter
-        // are "kept warm" by being resident even if not directly rendered.
-        for (auto bid : impl_->resident_scratch) {
-            impl_->block_last_used_iter[bid] = static_cast<std::int64_t>(iter);
-        }
-
-        // 6. Skip the load entirely when the resident set is identical to
-        //    last time. For the all-blocks case this fires exactly once per
-        //    training run (iter 0), giving v24 perf parity with Phase 3.4c.
-        impl_->last_pre_forward_loaded = false;
-        if (impl_->resident_scratch == impl_->last_loaded_ids) {
+            out_resident.resize(num_blocks);
+            std::iota(out_resident.begin(), out_resident.end(), std::size_t{0});
             return;
         }
 
-        // 7. Synchronous load. Phase 3.5.6 will swap this for a pipelined
-        //    prefetch (iter N+1's set staged while iter N computes), which is
-        //    what unlocks SSD-bound 1B training. For 3.5.2 a blocking load
-        //    matches what activate_all_blocks used to do.
-        auto result = impl_->working_set->load_and_activate(
-            *impl_->cache,
-            std::span<const std::size_t>(impl_->resident_scratch.data(),
-                                         impl_->resident_scratch.size()));
-        if (!result) {
+        // Mode C: visible-first + LRU fill.
+        out_used_lru = true;
+        out_resident.clear();
+        out_resident.reserve(capacity);
+
+        std::unordered_set<std::size_t> visible_set(
+            out_visible.begin(), out_visible.end());
+
+        if (visible_set.size() > capacity) {
             throw std::runtime_error(
-                "TideStrategy::pre_forward: WorkingSet::load_and_activate failed at iter " +
-                std::to_string(iter) + ": " + result.error());
+                "TideStrategy::pre_forward: visible set size " +
+                std::to_string(visible_set.size()) +
+                " exceeds WorkingSet capacity " + std::to_string(capacity) +
+                " at iter " + std::to_string(iter) +
+                " - increase --tide-capacity-blocks");
         }
-        impl_->last_loaded_ids = impl_->resident_scratch;
-        impl_->last_pre_forward_loaded = true;
+        for (auto vid : out_visible) {
+            out_resident.push_back(vid);
+        }
+
+        const std::size_t remaining = capacity - visible_set.size();
+        if (remaining > 0 && num_blocks > visible_set.size()) {
+            std::vector<std::pair<std::int64_t, std::size_t>> candidates;
+            candidates.reserve(num_blocks - visible_set.size());
+            for (std::size_t bid = 0; bid < num_blocks; ++bid) {
+                if (visible_set.count(bid)) continue;
+                auto it = impl_->block_last_used_iter.find(bid);
+                const std::int64_t lui = (it == impl_->block_last_used_iter.end())
+                                             ? std::int64_t{-1}
+                                             : it->second;
+                candidates.emplace_back(lui, bid);
+            }
+            const std::size_t k = std::min(remaining, candidates.size());
+            if (k < candidates.size()) {
+                std::nth_element(
+                    candidates.begin(), candidates.begin() + k, candidates.end(),
+                    [](const auto& a, const auto& b) { return a.first > b.first; });
+            }
+            for (std::size_t i = 0; i < k; ++i) {
+                out_resident.push_back(candidates[i].second);
+            }
+        }
+
+        std::sort(out_resident.begin(), out_resident.end());
     }
 
     void TideStrategy::pre_step(int /*iter*/, RenderOutput& /*render_output*/) {
@@ -1112,6 +1199,19 @@ namespace lfs::training {
     const std::vector<std::size_t>& TideStrategy::last_resident_block_ids() const noexcept {
         static const std::vector<std::size_t> empty;
         return impl_ ? impl_->resident_scratch : empty;
+    }
+
+    bool TideStrategy::has_pending_prefetch() const noexcept {
+        return impl_ && impl_->working_set && impl_->working_set->prefetch_pending();
+    }
+
+    const std::vector<std::size_t>& TideStrategy::last_prefetched_ids() const noexcept {
+        static const std::vector<std::size_t> empty;
+        return impl_ ? impl_->pending_prefetch_ids : empty;
+    }
+
+    TideStrategy::PrefetchStats TideStrategy::prefetch_stats() const noexcept {
+        return impl_ ? impl_->prefetch_stats : PrefetchStats{};
     }
 
 } // namespace lfs::training

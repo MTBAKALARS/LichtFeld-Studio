@@ -14,6 +14,7 @@
 #include "tide/working_set.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -92,6 +93,7 @@ namespace lfs::training {
         // IStrategy interface ----------------------------------------------
         void initialize(const lfs::core::param::OptimizationParameters& optimParams) override;
         void pre_forward(int iter, const lfs::core::Camera& cam) override;
+        void prefetch_next(int next_iter, const lfs::core::Camera& next_cam) override;
         void pre_step(int iter, RenderOutput& render_output) override;
         void post_backward(int iter, RenderOutput& render_output) override;
         void step(int iter) override;
@@ -166,7 +168,40 @@ namespace lfs::training {
         /// plus the LRU-fill blocks, sorted ascending by block_id.
         const std::vector<std::size_t>& last_resident_block_ids() const noexcept;
 
+        // Phase 3.5.6 pipelined-prefetch test accessors --------------------
+        /// True iff a prefetch has been issued by `prefetch_next` but not yet
+        /// consumed by `pre_forward` (i.e. WorkingSet::prefetch_pending()).
+        bool has_pending_prefetch() const noexcept;
+        /// Snapshot of the predicted resident block_id list staged by the
+        /// most recent `prefetch_next` call. Cleared when `pre_forward`
+        /// consumes (or drains) it.
+        const std::vector<std::size_t>& last_prefetched_ids() const noexcept;
+        /// Aggregate counters for the pipelined-prefetch state machine.
+        /// Monotonically non-decreasing across the lifetime of the strategy.
+        struct PrefetchStats {
+            std::uint64_t prefetches_issued          = 0; ///< prefetch_next that actually issued a WS::prefetch.
+            std::uint64_t prefetch_hits              = 0; ///< pre_forward consumed via wait_and_activate AND ids matched.
+            std::uint64_t prefetch_misses            = 0; ///< pre_forward drained a stale prefetch then sync-loaded.
+            std::uint64_t sync_loads                 = 0; ///< pre_forward fell through to WS::load_and_activate.
+            std::uint64_t prefetch_skipped_no_change = 0; ///< prefetch_next short-circuited because predicted == last_loaded_ids.
+        };
+        PrefetchStats prefetch_stats() const noexcept;
+
     private:
+        // Phase 3.5.6: shared core of `pre_forward` and `prefetch_next`. Pure
+        // computation — writes the visible block_id list to `out_visible`, the
+        // predicted resident block_id list to `out_resident`, and the LRU-branch
+        // flag to `out_used_lru`. May throw `std::runtime_error` when Mode C
+        // visible set exceeds capacity. Uses `impl_->bounds_scratch` and
+        // `planes_scratch` as internal temporaries; does NOT touch
+        // `last_visible_ids`, `last_pre_forward_used_lru`, `block_last_used_iter`,
+        // `visible_scratch`, or `resident_scratch`.
+        void compute_resident_set_(int iter,
+                                   const lfs::core::Camera& cam,
+                                   std::vector<std::size_t>& out_visible,
+                                   std::vector<std::size_t>& out_resident,
+                                   bool& out_used_lru);
+
         struct Impl;
         std::unique_ptr<Impl> impl_;
     };

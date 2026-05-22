@@ -50,6 +50,15 @@ namespace lfs::training {
         /// covers the camera.
         virtual void pre_forward(int /*iter*/, const lfs::core::Camera& /*cam*/) {}
 
+        /// Optional pipelining hook. Strategies that overlap streaming work with
+        /// training (e.g. TideStrategy) may stage the resident set predicted for
+        /// the next iteration's camera onto an inactive WorkingSet buffer on a
+        /// dedicated CUDA stream. Trainers may call this at end-of-iter once
+        /// they have peeked the next camera; the matching `pre_forward(next_iter,
+        /// next_cam)` at the start of the next iteration consumes it via
+        /// `wait_and_activate`. Safe to call repeatedly or never; default no-op.
+        virtual void prefetch_next(int /*next_iter*/, const lfs::core::Camera& /*next_cam*/) {}
+
         virtual void pre_step(int /*iter*/, RenderOutput& /*render_output*/) {}
 
         virtual void post_backward(int iter, RenderOutput& render_output) = 0;
