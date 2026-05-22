@@ -234,6 +234,79 @@ namespace lfs::training::tide {
     }
 
     // ============================================================
+    // step_external_moments (Phase 3.5.3c)
+    // ============================================================
+    std::expected<void, std::string>
+    TideResidentAdam::step_external_moments(
+        ParamType type,
+        float* param, const float* grad,
+        float* m, float* v,
+        std::size_t num_elements,
+        int64_t block_step_count,
+        int iteration) {
+
+        const std::size_t idx = type_index(type);
+        if (idx >= kNumParamTypes || !impl_ || !impl_->params[idx].allocated) {
+            return std::unexpected<std::string>(
+                std::string("TideResidentAdam::step_external_moments: param type not registered: ") +
+                std::string(type_name(type)));
+        }
+
+        // SH warmup gate. Match step()'s policy exactly: increment stats,
+        // do not touch buffers. Note we do NOT advance any internal step_count
+        // here — the caller owns block_step_count.
+        if (type == ParamType::ShN && iteration <= config_.sh_warmup_iterations) {
+            stats_.steps_skipped++;
+            return {};
+        }
+
+        if (num_elements == 0) {
+            stats_.steps_skipped++;
+            return {};
+        }
+
+        if (param == nullptr || grad == nullptr || m == nullptr || v == nullptr) {
+            return std::unexpected<std::string>(
+                "TideResidentAdam::step_external_moments: param/grad/m/v pointer is null");
+        }
+
+        if (block_step_count < 1) {
+            return std::unexpected<std::string>(
+                "TideResidentAdam::step_external_moments: block_step_count must be >= 1");
+        }
+
+        // Per-iteration scalar bias correction terms. Derived from the caller-
+        // supplied per-block step counter so that a block which sat out N
+        // iterations gets the right bias correction when it next steps.
+        const double bias_correction1_rcp =
+            1.0 / (1.0 - std::pow(config_.adam.beta1, block_step_count));
+        const double bias_correction2_sqrt_rcp =
+            1.0 / std::sqrt(1.0 - std::pow(config_.adam.beta2, block_step_count));
+
+        const auto& lrs = config_.adam.param_lrs;
+        const auto lr_key = std::string(type_name(type));
+        const float param_lr = lrs.contains(lr_key)
+            ? static_cast<float>(lrs.at(lr_key))
+            : config_.adam.lr;
+
+        fast_lfs::optimizer::adam_step_raw(
+            param,
+            m,
+            v,
+            grad,
+            static_cast<int>(num_elements),
+            param_lr,
+            static_cast<float>(config_.adam.beta1),
+            static_cast<float>(config_.adam.beta2),
+            static_cast<float>(config_.adam.eps),
+            static_cast<float>(bias_correction1_rcp),
+            static_cast<float>(bias_correction2_sqrt_rcp));
+
+        stats_.steps_total++;
+        return {};
+    }
+
+    // ============================================================
     // reset
     // ============================================================
     std::expected<void, std::string>

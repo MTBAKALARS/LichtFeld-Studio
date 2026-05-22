@@ -99,6 +99,61 @@ namespace lfs::training::tide {
              std::size_t num_elements, int iteration);
 
         /**
+         * @brief Adam step with caller-supplied (m, v) buffers.
+         *
+         * Identical math to @ref step(), but reads/writes the first/second
+         * moments from external device pointers instead of the internal
+         * @c exp_avg / @c exp_avg_sq buffers allocated by @ref create. This is
+         * the Phase 3.5.3c entry point that lets the trainer drive per-block
+         * Adam state out of a @ref WorkingSet moments slot (or any other
+         * caller-owned buffer); evicting and re-admitting a block preserves
+         * its Adam state because the buffer travels with the block, not with
+         * the optimizer.
+         *
+         * The caller owns:
+         *   - allocation / initialization of @p m and @p v (must be zeroed on
+         *     first use for a given block),
+         *   - the per-block step counter (@p block_step_count, see below).
+         *
+         * The optimizer's internal Adam state for @p type is **not** touched;
+         * neither is the internal per-type @c step_count. @ref Stats counters
+         * are updated the same as for @ref step.
+         *
+         * @param type                Which param to step. Must be registered
+         *                            via @ref create.
+         * @param param               Device pointer to the param buffer
+         *                            (writable, @p num_elements floats).
+         * @param grad                Device pointer to the gradient buffer
+         *                            (read-only, @p num_elements floats).
+         * @param m                   Device pointer to the first-moment
+         *                            buffer (read/write, @p num_elements
+         *                            floats). Must be zero on the first call
+         *                            for a given block.
+         * @param v                   Device pointer to the second-moment
+         *                            buffer (read/write, @p num_elements
+         *                            floats). Must be zero on the first call
+         *                            for a given block.
+         * @param num_elements        Length of @p param/grad/m/v in floats.
+         * @param block_step_count    Per-block step counter (1-based). The
+         *                            caller increments this once per actual
+         *                            adam_step call for the block. Used to
+         *                            compute bias correction. Must be >= 1
+         *                            on non-warmup, non-empty calls.
+         * @param iteration           Current training iteration (>= 1). Used
+         *                            only for the ShN warmup gate; the per-
+         *                            block bias correction comes from
+         *                            @p block_step_count.
+         */
+        std::expected<void, std::string>
+        step_external_moments(
+            ParamType type,
+            float* param, const float* grad,
+            float* m, float* v,
+            std::size_t num_elements,
+            int64_t block_step_count,
+            int iteration);
+
+        /**
          * @brief Zero exp_avg / exp_avg_sq for a param type and reset its step_count.
          *
          * Useful when the working set evicts all resident state and starts fresh.

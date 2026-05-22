@@ -356,4 +356,252 @@ namespace {
         cudaFree(dg);
     }
 
+    // =============================================================
+    // Phase 3.5.3c: step_external_moments
+    // =============================================================
+
+    // External-moments step on the same inputs must produce bit-identical
+    // results to the internal-buffer step. This is the equivalence guarantee
+    // that lets the trainer move Adam state into per-block WorkingSet slots
+    // without changing the optimizer math.
+    TEST_F(TideResidentAdamTest, ExternalStepMatchesInternalStep) {
+        constexpr std::size_t kN = 256;
+        constexpr int kIters = 12;
+
+        std::mt19937 rng(0xBEEF);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        std::vector<float> p0(kN), g0(kN);
+        for (auto& x : p0) x = dist(rng);
+        for (auto& x : g0) x = dist(rng) * 0.1f;
+
+        AdamConfig adam;
+        adam.lr = 1e-3;
+        adam.beta1 = 0.9;
+        adam.beta2 = 0.999;
+        adam.eps = 1e-8;
+        TideResidentAdam::Config cfg; cfg.adam = adam; cfg.cuda_device = kCudaDevice;
+        const std::array<TideResidentAdam::ParamSpec, 1> specs{{
+            {ParamType::Means, kN},
+        }};
+
+        // ---- Internal-buffer optimizer ----
+        auto opt_int_r = TideResidentAdam::create(cfg, specs);
+        ASSERT_TRUE(opt_int_r.has_value()) << opt_int_r.error();
+        auto& opt_int = *opt_int_r.value();
+        auto p_int_host = p0;
+        float* p_int = device_upload(p_int_host);
+        float* g_int = device_upload(g0);
+
+        // ---- External-buffer optimizer ----
+        auto opt_ext_r = TideResidentAdam::create(cfg, specs);
+        ASSERT_TRUE(opt_ext_r.has_value()) << opt_ext_r.error();
+        auto& opt_ext = *opt_ext_r.value();
+        std::vector<float> p_ext_host = p0;
+        float* p_ext = device_upload(p_ext_host);
+        float* g_ext = device_upload(g0);
+
+        // Caller-owned m+v buffers (zeroed).
+        const std::size_t bytes = kN * sizeof(float);
+        float *m_ext = nullptr, *v_ext = nullptr;
+        ASSERT_EQ(cudaMalloc(reinterpret_cast<void**>(&m_ext), bytes), cudaSuccess);
+        ASSERT_EQ(cudaMalloc(reinterpret_cast<void**>(&v_ext), bytes), cudaSuccess);
+        ASSERT_EQ(cudaMemset(m_ext, 0, bytes), cudaSuccess);
+        ASSERT_EQ(cudaMemset(v_ext, 0, bytes), cudaSuccess);
+
+        for (int it = 1; it <= kIters; ++it) {
+            ASSERT_TRUE(opt_int.step(ParamType::Means, p_int, g_int, kN, it).has_value());
+            ASSERT_TRUE(opt_ext.step_external_moments(
+                ParamType::Means, p_ext, g_ext, m_ext, v_ext, kN,
+                /*block_step_count=*/it, it).has_value());
+        }
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+        auto p_int_back = device_download(p_int, kN);
+        auto p_ext_back = device_download(p_ext, kN);
+        // Bit-identical: same kernel, same inputs, same step_count.
+        for (std::size_t i = 0; i < kN; ++i) {
+            ASSERT_EQ(p_int_back[i], p_ext_back[i]) << "i=" << i;
+        }
+
+        // External-moments path must not touch internal state.
+        EXPECT_EQ(opt_ext.step_count(ParamType::Means), 0);
+        EXPECT_EQ(opt_int.step_count(ParamType::Means), kIters);
+
+        cudaFree(p_int); cudaFree(g_int);
+        cudaFree(p_ext); cudaFree(g_ext);
+        cudaFree(m_ext); cudaFree(v_ext);
+    }
+
+    TEST_F(TideResidentAdamTest, ExternalStepSkipsShNDuringWarmup) {
+        constexpr std::size_t kN = 64;
+        AdamConfig adam;
+        TideResidentAdam::Config cfg; cfg.adam = adam; cfg.cuda_device = kCudaDevice;
+        cfg.sh_warmup_iterations = 100;
+        const std::array<TideResidentAdam::ParamSpec, 1> specs{{
+            {ParamType::ShN, kN},
+        }};
+        auto opt_r = TideResidentAdam::create(cfg, specs);
+        ASSERT_TRUE(opt_r.has_value()) << opt_r.error();
+        auto& opt = *opt_r.value();
+
+        const std::size_t bytes = kN * sizeof(float);
+        float *p, *g, *m, *v;
+        ASSERT_EQ(cudaMalloc(reinterpret_cast<void**>(&p), bytes), cudaSuccess);
+        ASSERT_EQ(cudaMalloc(reinterpret_cast<void**>(&g), bytes), cudaSuccess);
+        ASSERT_EQ(cudaMalloc(reinterpret_cast<void**>(&m), bytes), cudaSuccess);
+        ASSERT_EQ(cudaMalloc(reinterpret_cast<void**>(&v), bytes), cudaSuccess);
+        std::vector<float> ones(kN, 1.0f);
+        ASSERT_EQ(cudaMemcpy(p, ones.data(), bytes, cudaMemcpyHostToDevice), cudaSuccess);
+        ASSERT_EQ(cudaMemcpy(g, ones.data(), bytes, cudaMemcpyHostToDevice), cudaSuccess);
+        ASSERT_EQ(cudaMemset(m, 0, bytes), cudaSuccess);
+        ASSERT_EQ(cudaMemset(v, 0, bytes), cudaSuccess);
+
+        // During warmup: should be a no-op.
+        ASSERT_TRUE(opt.step_external_moments(
+            ParamType::ShN, p, g, m, v, kN, /*block_step*/1, /*iter*/50).has_value());
+        auto p_back = device_download(p, kN);
+        for (auto x : p_back) EXPECT_EQ(x, 1.0f);
+        EXPECT_EQ(opt.stats().steps_skipped, 1u);
+        EXPECT_EQ(opt.stats().steps_total, 0u);
+
+        // After warmup: actually steps.
+        ASSERT_TRUE(opt.step_external_moments(
+            ParamType::ShN, p, g, m, v, kN, /*block_step*/1, /*iter*/101).has_value());
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+        p_back = device_download(p, kN);
+        EXPECT_NE(p_back[0], 1.0f);
+        EXPECT_EQ(opt.stats().steps_total, 1u);
+
+        cudaFree(p); cudaFree(g); cudaFree(m); cudaFree(v);
+    }
+
+    TEST_F(TideResidentAdamTest, ExternalStepRejectsNullPointers) {
+        AdamConfig adam;
+        TideResidentAdam::Config cfg; cfg.adam = adam; cfg.cuda_device = kCudaDevice;
+        const std::array<TideResidentAdam::ParamSpec, 1> specs{{
+            {ParamType::Means, 32},
+        }};
+        auto opt_r = TideResidentAdam::create(cfg, specs);
+        ASSERT_TRUE(opt_r.has_value());
+        auto& opt = *opt_r.value();
+
+        float dummy = 0;
+        auto r = opt.step_external_moments(
+            ParamType::Means, nullptr, &dummy, &dummy, &dummy, 32, 1, 1);
+        EXPECT_FALSE(r.has_value());
+        EXPECT_NE(r.error().find("null"), std::string::npos);
+
+        r = opt.step_external_moments(
+            ParamType::Means, &dummy, &dummy, nullptr, &dummy, 32, 1, 1);
+        EXPECT_FALSE(r.has_value());
+
+        r = opt.step_external_moments(
+            ParamType::Means, &dummy, &dummy, &dummy, nullptr, 32, 1, 1);
+        EXPECT_FALSE(r.has_value());
+
+        // block_step_count < 1 rejected on non-warmup, non-empty calls.
+        auto r2 = opt.step_external_moments(
+            ParamType::Means, &dummy, &dummy, &dummy, &dummy, 32, 0, 1);
+        EXPECT_FALSE(r2.has_value());
+        EXPECT_NE(r2.error().find("block_step_count"), std::string::npos);
+    }
+
+    TEST_F(TideResidentAdamTest, ExternalStepZeroNumElementsIsNoOp) {
+        AdamConfig adam;
+        TideResidentAdam::Config cfg; cfg.adam = adam; cfg.cuda_device = kCudaDevice;
+        const std::array<TideResidentAdam::ParamSpec, 1> specs{{
+            {ParamType::ShN, 0},
+        }};
+        auto opt_r = TideResidentAdam::create(cfg, specs);
+        ASSERT_TRUE(opt_r.has_value()) << opt_r.error();
+        auto& opt = *opt_r.value();
+
+        // num_elements=0 should be a clean no-op, even with null buffers.
+        auto r = opt.step_external_moments(
+            ParamType::ShN, nullptr, nullptr, nullptr, nullptr,
+            /*num_elements=*/0, /*block_step*/1, /*iter*/9999);
+        EXPECT_TRUE(r.has_value()) << r.error();
+        EXPECT_EQ(opt.stats().steps_skipped, 1u);
+        EXPECT_EQ(opt.stats().steps_total, 0u);
+    }
+
+    // Verifies that the external-moments path is a true read/write of caller-
+    // owned buffers: re-binding to different (m,v) buffers between iterations
+    // (simulating block evict + re-admit where state travels with the block)
+    // produces the same updates as keeping (m,v) resident the whole time.
+    TEST_F(TideResidentAdamTest, ExternalStepStatePreservedAcrossRebind) {
+        constexpr std::size_t kN = 128;
+        constexpr int kIters = 6;
+
+        std::mt19937 rng(0xC0DE);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        std::vector<float> p0(kN), g0(kN);
+        for (auto& x : p0) x = dist(rng);
+        for (auto& x : g0) x = dist(rng) * 0.1f;
+
+        AdamConfig adam;
+        TideResidentAdam::Config cfg; cfg.adam = adam; cfg.cuda_device = kCudaDevice;
+        const std::array<TideResidentAdam::ParamSpec, 1> specs{{
+            {ParamType::Means, kN},
+        }};
+
+        // ---- Reference: m,v stay in the same buffer the whole time. ----
+        auto opt_ref_r = TideResidentAdam::create(cfg, specs);
+        ASSERT_TRUE(opt_ref_r.has_value());
+        auto& opt_ref = *opt_ref_r.value();
+        const std::size_t bytes = kN * sizeof(float);
+        auto p_ref_host = p0;
+        float* p_ref = device_upload(p_ref_host);
+        float* g_ref = device_upload(g0);
+        float *m_ref, *v_ref;
+        ASSERT_EQ(cudaMalloc(reinterpret_cast<void**>(&m_ref), bytes), cudaSuccess);
+        ASSERT_EQ(cudaMalloc(reinterpret_cast<void**>(&v_ref), bytes), cudaSuccess);
+        ASSERT_EQ(cudaMemset(m_ref, 0, bytes), cudaSuccess);
+        ASSERT_EQ(cudaMemset(v_ref, 0, bytes), cudaSuccess);
+        for (int it = 1; it <= kIters; ++it) {
+            ASSERT_TRUE(opt_ref.step_external_moments(
+                ParamType::Means, p_ref, g_ref, m_ref, v_ref, kN, it, it).has_value());
+        }
+
+        // ---- Rebind: each iter, m,v are copied OUT to "cache", a new
+        //      device buffer is allocated, contents copied IN. Simulates the
+        //      WS -> cache -> WS round trip in 3.5.3b. ----
+        auto opt_re_r = TideResidentAdam::create(cfg, specs);
+        ASSERT_TRUE(opt_re_r.has_value());
+        auto& opt_re = *opt_re_r.value();
+        auto p_re_host = p0;
+        float* p_re = device_upload(p_re_host);
+        float* g_re = device_upload(g0);
+
+        std::vector<float> m_cache(kN, 0.0f), v_cache(kN, 0.0f);
+        for (int it = 1; it <= kIters; ++it) {
+            // "Re-admit": upload cached m,v into a freshly-allocated device buf.
+            float *m_curr, *v_curr;
+            ASSERT_EQ(cudaMalloc(reinterpret_cast<void**>(&m_curr), bytes), cudaSuccess);
+            ASSERT_EQ(cudaMalloc(reinterpret_cast<void**>(&v_curr), bytes), cudaSuccess);
+            ASSERT_EQ(cudaMemcpy(m_curr, m_cache.data(), bytes, cudaMemcpyHostToDevice), cudaSuccess);
+            ASSERT_EQ(cudaMemcpy(v_curr, v_cache.data(), bytes, cudaMemcpyHostToDevice), cudaSuccess);
+
+            ASSERT_TRUE(opt_re.step_external_moments(
+                ParamType::Means, p_re, g_re, m_curr, v_curr, kN, it, it).has_value());
+
+            // "Evict": download m,v back to cache, free the device buffer.
+            ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+            ASSERT_EQ(cudaMemcpy(m_cache.data(), m_curr, bytes, cudaMemcpyDeviceToHost), cudaSuccess);
+            ASSERT_EQ(cudaMemcpy(v_cache.data(), v_curr, bytes, cudaMemcpyDeviceToHost), cudaSuccess);
+            cudaFree(m_curr); cudaFree(v_curr);
+        }
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+        // Params must be bit-identical: Adam state survived the round-trip.
+        auto p_ref_back = device_download(p_ref, kN);
+        auto p_re_back  = device_download(p_re, kN);
+        for (std::size_t i = 0; i < kN; ++i) {
+            ASSERT_EQ(p_ref_back[i], p_re_back[i]) << "i=" << i;
+        }
+
+        cudaFree(p_ref); cudaFree(g_ref); cudaFree(m_ref); cudaFree(v_ref);
+        cudaFree(p_re);  cudaFree(g_re);
+    }
+
 } // namespace
