@@ -112,6 +112,7 @@ set(TEST_FILES
     test_block_store.cpp
     test_frustum_culler.cpp
     test_working_set.cpp
+    test_aos_soa_repack.cpp
     test_tide_resident_adam.cpp
     test_loss_gradients.cpp
     test_regularization_comparison.cpp
