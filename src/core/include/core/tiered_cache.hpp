@@ -58,6 +58,10 @@ namespace lfs::core {
             std::atomic<std::uint64_t> async_flush_jobs{0};
             std::atomic<std::uint64_t> sync_flushes{0};
             std::atomic<std::uint64_t> dirty_blocks_resident{0};
+            // Phase 3.5.5 — telemetry for the async writeback path.
+            std::atomic<std::uint64_t> async_dirty_evictions{0};   ///< Dirty regions enqueued by eviction
+            std::atomic<std::uint64_t> backpressure_waits{0};       ///< Times an enqueue blocked on watermark
+            std::atomic<std::uint64_t> miss_drain_waits{0};         ///< Misses that had to wait for an in-flight async flush
         };
 
         TieredCache(std::shared_ptr<BlockStore> store, const Config& config);
@@ -134,11 +138,27 @@ namespace lfs::core {
         std::size_t evict_clean(std::size_t k);
 
         /**
-         * @brief Synchronously flush all dirty blocks to the underlying store.
+         * @brief Synchronously flush all dirty resident blocks AND drain any
+         *        pending async write-backs to the underlying @ref BlockStore.
          *
-         * Used at consistency barriers (checkpoint, shutdown).
+         * Used at consistency barriers (checkpoint, shutdown). After this call
+         * returns, every byte the caller wrote via @ref pin_for_write or
+         * @ref pin_moments_for_write is durable on the underlying store, whether
+         * it was still resident or had already been evicted with an in-flight
+         * async flush in progress.
          */
         std::expected<void, std::string> flush_dirty();
+
+        /**
+         * @brief Block until the async flusher queue is empty and the worker is
+         *        idle. Does NOT initiate any new flushes (use @ref flush_dirty
+         *        for that). Returned the last error reported by the worker, if
+         *        any, then clears it.
+         *
+         * Phase 3.5.5 API. Safe to call concurrently with @ref get / @ref unpin /
+         * @ref evict_clean.
+         */
+        std::expected<void, std::string> drain_async_flushes();
 
         // === Introspection ===
 
@@ -189,9 +209,18 @@ namespace lfs::core {
             bool is_moments = false;
         };
         std::mutex flush_mutex_;
-        std::condition_variable flush_cv_;
+        std::condition_variable flush_cv_;          ///< Worker wakes on job arrival or stop
+        std::condition_variable flush_drain_cv_;    ///< Notified when a block's in-flight count hits 0
+        std::condition_variable flush_room_cv_;     ///< Notified when queue size drops below high-watermark
         std::list<FlushJob> flush_queue_;
         std::atomic<bool> flush_stop_{false};
+        std::atomic<bool> worker_busy_{false};       ///< True while worker is processing a job
+        // Per-block reference count of pending+in-flight async flush jobs. A block
+        // with a non-zero entry has dirty bytes that have been evicted from cache
+        // but may not yet be on the SSD; @ref get() must wait for the count to
+        // hit 0 before issuing the BlockStore read on that block.
+        std::unordered_map<std::size_t, std::uint32_t> in_flight_flush_counts_;
+        std::string flush_worker_error_;             ///< Last worker error (under flush_mutex_)
         std::thread flush_thread_;
 
         std::unique_ptr<Stats> stats_;
@@ -202,7 +231,15 @@ namespace lfs::core {
         std::expected<LruList::iterator, std::string> insert_block_(std::size_t block_id);
         void touch_(LruList::iterator it);
         void evict_one_clean_();
-        void enqueue_flush_(std::size_t block_id, std::byte* buffer);
+        // Phase 3.5.5: try to evict the LRU-most unpinned block, async-flushing
+        // any dirty regions. Returns true if a block was evicted. Must be called
+        // with mutex_ held; briefly acquires flush_mutex_ in addition
+        // (lock order: mutex_ -> flush_mutex_) to atomically bump in_flight_
+        // counts before the cache entry is removed.
+        bool evict_one_async_();
+        // Block while an async flush is in flight for @p block_id. Caller MUST NOT
+        // hold mutex_. Increments stats_->miss_drain_waits if it actually waited.
+        void wait_for_in_flight_(std::size_t block_id);
         void flush_worker_();
     };
 

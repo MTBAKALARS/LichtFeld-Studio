@@ -147,6 +147,11 @@ namespace lfs::core {
         stats_->misses.fetch_add(1, std::memory_order_relaxed);
 
         lk.unlock();
+        // Phase 3.5.5: if this block has a pending/in-flight async write-back
+        // (e.g., we evicted it dirty and the worker hasn't yet persisted it),
+        // wait for the queue to drain BEFORE reading from the store. Otherwise
+        // the store read would return stale bytes.
+        wait_for_in_flight_(block_id);
         // Disk read outside the lock — no other thread can touch a freshly-pinned node.
         if (auto r = store_->read_block(block_id, std::span<std::byte>{node.buffer, bytes_per_block_}); !r) {
             // Roll back the insertion on read failure.
@@ -323,6 +328,23 @@ namespace lfs::core {
             }
             stats_->sync_flushes.fetch_add(1, std::memory_order_relaxed);
         }
+        // Phase 3.5.5: also drain any in-flight async writes so the post-condition
+        // ("every dirty byte the caller ever produced is on the store") holds.
+        return drain_async_flushes();
+    }
+
+    std::expected<void, std::string> TieredCache::drain_async_flushes() {
+        std::unique_lock flk(flush_mutex_);
+        flush_drain_cv_.wait(flk, [&] {
+            return flush_queue_.empty()
+                   && !worker_busy_.load(std::memory_order_acquire)
+                   && in_flight_flush_counts_.empty();
+        });
+        if (!flush_worker_error_.empty()) {
+            std::string err = std::move(flush_worker_error_);
+            flush_worker_error_.clear();
+            return std::unexpected{std::move(err)};
+        }
         return {};
     }
 
@@ -358,68 +380,18 @@ namespace lfs::core {
         while (lru_list_.size() >= config_.capacity_blocks) {
             const std::size_t before = lru_list_.size();
             evict_one_clean_();
-            if (lru_list_.size() == before) {
-                // Couldn't evict anything — every resident block is pinned or dirty.
-                // Force a synchronous flush of the LRU dirty block to make progress.
-                // A block counts as "dirty" if either its data or moments region is dirty.
-                bool flushed_any = false;
-                for (auto it = lru_list_.begin(); it != lru_list_.end(); ++it) {
-                    auto& node = *it->node;
-                    if (node.pin_count != 0) continue;
-                    if (!node.dirty && !node.moments_dirty) continue;
+            if (lru_list_.size() != before) continue;
 
-                    // Snapshot whichever region(s) are dirty before dropping the lock.
-                    std::vector<std::byte> data_payload;
-                    std::vector<std::byte> moments_payload;
-                    if (node.dirty) {
-                        data_payload.resize(bytes_per_block_);
-                        std::memcpy(data_payload.data(), node.buffer, bytes_per_block_);
-                    }
-                    if (node.moments_dirty && moments_bytes_per_block_ > 0) {
-                        moments_payload.resize(moments_bytes_per_block_);
-                        std::memcpy(moments_payload.data(),
-                                    node.buffer + bytes_per_block_,
-                                    moments_bytes_per_block_);
-                    }
-                    const std::size_t flush_id = node.block_id;
-                    const bool was_data_dirty = node.dirty;
-                    const bool was_moments_dirty = node.moments_dirty;
+            // No clean block was available. Phase 3.5.5: walk LRU for the first
+            // unpinned dirty block and evict it via async write-back (snapshot
+            // dirty regions into the flush queue, then release the cache slot).
+            if (evict_one_async_()) continue;
 
-                    // Drop the lock during the SSD writes.
-                    mutex_.unlock();
-                    if (was_data_dirty) {
-                        auto r = store_->write_block(flush_id, data_payload);
-                        if (!r) {
-                            mutex_.lock();
-                            return std::unexpected{r.error()};
-                        }
-                    }
-                    if (was_moments_dirty) {
-                        auto r = store_->write_moments(flush_id, moments_payload);
-                        if (!r) {
-                            mutex_.lock();
-                            return std::unexpected{r.error()};
-                        }
-                    }
-                    mutex_.lock();
-
-                    if (was_data_dirty) {
-                        node.dirty = false;
-                        stats_->dirty_blocks_resident.fetch_sub(1, std::memory_order_relaxed);
-                        stats_->sync_flushes.fetch_add(1, std::memory_order_relaxed);
-                    }
-                    if (was_moments_dirty) {
-                        node.moments_dirty = false;
-                        stats_->sync_flushes.fetch_add(1, std::memory_order_relaxed);
-                    }
-                    flushed_any = true;
-                    break;
-                }
-                if (!flushed_any) {
-                    return std::unexpected{"TieredCache: cache full and all blocks pinned (deadlock)"};
-                }
-                evict_one_clean_();
-            }
+            // Every resident block is pinned. This is a real configuration
+            // deadlock — the caller asked for more concurrent pins than capacity.
+            return std::unexpected{
+                "TieredCache: cache full and all blocks pinned (deadlock); "
+                "increase capacity_blocks or release pins"};
         }
 
         auto* buf = allocate_buffer_();
@@ -458,15 +430,93 @@ namespace lfs::core {
         }
     }
 
-    void TieredCache::enqueue_flush_(std::size_t block_id, std::byte* buffer) {
-        FlushJob job;
-        job.block_id = block_id;
-        job.payload.assign(buffer, buffer + bytes_per_block_);
-        {
-            std::scoped_lock lk(flush_mutex_);
-            flush_queue_.push_back(std::move(job));
+    bool TieredCache::evict_one_async_() {
+        // Caller holds mutex_. Find the LRU-most unpinned dirty block, snapshot
+        // its dirty region(s), hand them to the async worker, and remove the
+        // cache entry. The buffer is returned to the free pool immediately —
+        // the worker owns its own payload copy.
+        //
+        // Lock order: mutex_ -> flush_mutex_. We acquire flush_mutex_ while
+        // still holding mutex_ so the in-flight counter is bumped BEFORE the
+        // cache entry is erased; any racing get(evict_id) that takes mutex_
+        // after we release it will observe the in-flight entry and block on
+        // wait_for_in_flight_ before reading stale bytes from the store.
+        for (auto it = lru_list_.begin(); it != lru_list_.end(); ++it) {
+            auto& node = *it->node;
+            if (node.pin_count != 0) continue;
+            if (!node.dirty && !node.moments_dirty) continue;
+
+            const std::size_t evict_id = node.block_id;
+            const bool was_data_dirty = node.dirty;
+            const bool was_moments_dirty = node.moments_dirty;
+
+            std::vector<std::byte> data_payload;
+            std::vector<std::byte> moments_payload;
+            if (was_data_dirty) {
+                data_payload.assign(node.buffer, node.buffer + bytes_per_block_);
+            }
+            if (was_moments_dirty && moments_bytes_per_block_ > 0) {
+                moments_payload.assign(node.buffer + bytes_per_block_,
+                                       node.buffer + bytes_per_block_ + moments_bytes_per_block_);
+            }
+
+            {
+                std::unique_lock flk(flush_mutex_);
+                // High-watermark backpressure: stall eviction until the worker
+                // catches up. We hold mutex_ during this wait, which is the
+                // intended global throttle — under sustained dirty-eviction
+                // pressure the caller's training thread is what should pause.
+                if (config_.flush_queue_high_watermark > 0
+                    && flush_queue_.size() >= config_.flush_queue_high_watermark) {
+                    stats_->backpressure_waits.fetch_add(1, std::memory_order_relaxed);
+                    flush_room_cv_.wait(flk, [&] {
+                        return flush_queue_.size() < config_.flush_queue_high_watermark
+                               || flush_stop_.load(std::memory_order_acquire);
+                    });
+                }
+                if (was_data_dirty) {
+                    FlushJob job;
+                    job.block_id = evict_id;
+                    job.payload = std::move(data_payload);
+                    job.is_moments = false;
+                    flush_queue_.push_back(std::move(job));
+                    ++in_flight_flush_counts_[evict_id];
+                }
+                if (was_moments_dirty) {
+                    FlushJob job;
+                    job.block_id = evict_id;
+                    job.payload = std::move(moments_payload);
+                    job.is_moments = true;
+                    flush_queue_.push_back(std::move(job));
+                    ++in_flight_flush_counts_[evict_id];
+                }
+            }
+            flush_cv_.notify_one();
+
+            if (was_data_dirty) {
+                stats_->dirty_blocks_resident.fetch_sub(1, std::memory_order_relaxed);
+            }
+            release_buffer_(node.buffer);
+            map_.erase(evict_id);
+            lru_list_.erase(it);
+            stats_->evictions.fetch_add(1, std::memory_order_relaxed);
+            stats_->async_dirty_evictions.fetch_add(
+                (was_data_dirty ? 1u : 0u) + (was_moments_dirty ? 1u : 0u),
+                std::memory_order_relaxed);
+            return true;
         }
-        flush_cv_.notify_one();
+        return false;
+    }
+
+    void TieredCache::wait_for_in_flight_(std::size_t block_id) {
+        std::unique_lock flk(flush_mutex_);
+        if (in_flight_flush_counts_.find(block_id) == in_flight_flush_counts_.end()) {
+            return;
+        }
+        stats_->miss_drain_waits.fetch_add(1, std::memory_order_relaxed);
+        flush_drain_cv_.wait(flk, [&] {
+            return in_flight_flush_counts_.find(block_id) == in_flight_flush_counts_.end();
+        });
     }
 
     void TieredCache::flush_worker_() {
@@ -480,28 +530,38 @@ namespace lfs::core {
                 if (flush_stop_.load(std::memory_order_acquire) && flush_queue_.empty()) return;
                 job = std::move(flush_queue_.front());
                 flush_queue_.pop_front();
+                worker_busy_.store(true, std::memory_order_release);
+                // Wake any producer waiting on backpressure now that the queue shrank.
+                flush_room_cv_.notify_one();
             }
-            const bool ok = [&] {
-                if (job.is_moments) {
-                    auto r = store_->write_moments(job.block_id, job.payload);
-                    if (!r) {
-                        LOG_ERROR("TieredCache: async flush of block {} (moments) failed: {}",
-                                  job.block_id, r.error());
-                        return false;
-                    }
+            std::expected<void, std::string> r;
+            if (job.is_moments) {
+                auto wr = store_->write_moments(job.block_id, job.payload);
+                if (!wr) r = std::unexpected{wr.error()};
+            } else {
+                auto wr = store_->write_block(job.block_id, job.payload);
+                if (!wr) r = std::unexpected{wr.error()};
+            }
+            {
+                std::scoped_lock lk(flush_mutex_);
+                if (!r) {
+                    LOG_ERROR("TieredCache: async flush of block {} ({}) failed: {}",
+                              job.block_id, job.is_moments ? "moments" : "data", r.error());
+                    flush_worker_error_ = r.error();
                 } else {
-                    auto r = store_->write_block(job.block_id, job.payload);
-                    if (!r) {
-                        LOG_ERROR("TieredCache: async flush of block {} (data) failed: {}",
-                                  job.block_id, r.error());
-                        return false;
+                    stats_->async_flush_jobs.fetch_add(1, std::memory_order_relaxed);
+                }
+                auto cnt_it = in_flight_flush_counts_.find(job.block_id);
+                if (cnt_it != in_flight_flush_counts_.end()) {
+                    if (--cnt_it->second == 0) {
+                        in_flight_flush_counts_.erase(cnt_it);
                     }
                 }
-                return true;
-            }();
-            if (ok) {
-                stats_->async_flush_jobs.fetch_add(1, std::memory_order_relaxed);
+                worker_busy_.store(false, std::memory_order_release);
             }
+            // Notify drain waiters AND backpressure waiters.
+            flush_drain_cv_.notify_all();
+            flush_room_cv_.notify_one();
         }
     }
 

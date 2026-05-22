@@ -3056,6 +3056,14 @@ namespace lfs::training {
             return std::unexpected("Cannot save checkpoint: no strategy initialized");
         }
 
+        // If Tide is active, ensure all in-cache dirty work has been persisted to
+        // BlockStore before the checkpoint snapshots strategy state.
+        if (tide_runtime_ && tide_runtime_->cache) {
+            if (auto fr = tide_runtime_->cache->flush_dirty(); !fr) {
+                return std::unexpected("Tide cache flush_dirty failed before checkpoint: " + fr.error());
+            }
+        }
+
         PPISPControllerPool* controller_to_save = controller_pool_for_save(iteration);
 
         return lfs::training::save_checkpoint(params_.dataset.output_path, iteration, *strategy_, params_,
@@ -3066,6 +3074,13 @@ namespace lfs::training {
                                                                  int iteration) {
         if (!strategy_) {
             return std::unexpected("Cannot save checkpoint: no strategy initialized");
+        }
+
+        // Mirror the Tide drain in the to-path variant.
+        if (tide_runtime_ && tide_runtime_->cache) {
+            if (auto fr = tide_runtime_->cache->flush_dirty(); !fr) {
+                return std::unexpected("Tide cache flush_dirty failed before checkpoint: " + fr.error());
+            }
         }
 
         PPISPControllerPool* controller_to_save = controller_pool_for_save(iteration);

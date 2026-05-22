@@ -649,3 +649,185 @@ TEST(TieredCacheMomentsTest, MissPathReadsBothRegions) {
     cache.unpin(1, /*dirty=*/false);
 }
 
+// ============================================================================
+// Phase 3.5.5: async-flush primary path + drain + in-flight tracking
+// ============================================================================
+//
+// TieredCache no longer refuses to evict dirty blocks. When the cache is full
+// and the LRU candidate is dirty, the dirty region(s) are snapshotted into
+// FlushJobs, the cache slot is freed for the incoming block, and an async
+// worker writes the snapshots to BlockStore. flush_dirty() now also waits for
+// the async queue to drain. A racing get() of a still-in-flight block blocks
+// until the worker persists the bytes before reading from the store.
+
+TEST(TieredCacheAsyncFlushTest, EvictDirtyEventuallyReachesStoreAfterDrain) {
+    TempDir tmp;
+    auto store = share(make_store_with_moments(tmp.path() / "store", 4, false));
+    ASSERT_NE(store, nullptr);
+
+    TieredCache::Config cfg;
+    cfg.capacity_blocks = 2;
+    TieredCache cache(store, cfg);
+
+    // Dirty block 0.
+    {
+        auto w = cache.pin_for_write(0);
+        ASSERT_TRUE(w.has_value()) << w.error();
+        std::fill(w.value().begin(), w.value().end(), std::byte{0xA1});
+        cache.unpin(0, /*dirty=*/true);
+    }
+    // Fill cache to force eviction of block 0. Capacity=2: pin block 1 to occupy
+    // one slot, then load block 2. Block 1 stays pinned, block 0 is unpinned but
+    // dirty -> must take the async dirty-eviction path.
+    ASSERT_TRUE(cache.get(1).has_value()); // keep pinned
+    ASSERT_TRUE(cache.get(2).has_value()); // forces eviction of block 0 (dirty)
+    cache.unpin(1, /*dirty=*/false);
+    cache.unpin(2, /*dirty=*/false);
+
+    // Block 0 must no longer be resident.
+    EXPECT_LE(cache.resident_blocks(), cfg.capacity_blocks);
+
+    // Drain via flush_dirty (no resident dirties left, but the async queue may
+    // still be processing the eviction). After this returns, the SSD must reflect
+    // the writes.
+    auto fr = cache.flush_dirty();
+    ASSERT_TRUE(fr.has_value()) << fr.error();
+    EXPECT_GE(cache.stats().async_dirty_evictions.load(), 1u);
+
+    std::vector<std::byte> buf(store->bytes_per_block());
+    ASSERT_TRUE(store->read_block(0, std::span<std::byte>(buf)).has_value());
+    for (std::size_t i = 0; i < buf.size(); ++i) {
+        ASSERT_EQ(buf[i], std::byte{0xA1}) << "byte " << i << " not flushed";
+    }
+}
+
+TEST(TieredCacheAsyncFlushTest, ReGetOfInflightBlockReturnsFreshBytes) {
+    TempDir tmp;
+    auto store = share(make_store_with_moments(tmp.path() / "store", 4, false));
+    ASSERT_NE(store, nullptr);
+
+    TieredCache::Config cfg;
+    cfg.capacity_blocks = 2;
+    TieredCache cache(store, cfg);
+
+    // Write a recognizable pattern to block 0 and evict via cache pressure.
+    {
+        auto w = cache.pin_for_write(0);
+        ASSERT_TRUE(w.has_value()) << w.error();
+        std::fill(w.value().begin(), w.value().end(), std::byte{0xB7});
+        cache.unpin(0, /*dirty=*/true);
+    }
+    for (std::size_t b : {1u, 2u}) {
+        ASSERT_TRUE(cache.get(b).has_value());
+        cache.unpin(b, /*dirty=*/false);
+    }
+
+    // Immediately re-fetch block 0. The get() miss path must wait for the
+    // async flush of block 0 to drain before reading from the store, otherwise
+    // we'd see the pre-mutation bytes.
+    auto v = cache.get(0);
+    ASSERT_TRUE(v.has_value()) << v.error();
+    for (std::size_t i = 0; i < v.value().size(); ++i) {
+        ASSERT_EQ(v.value()[i], std::byte{0xB7})
+            << "byte " << i << " — read raced async writeback";
+    }
+    cache.unpin(0, /*dirty=*/false);
+    // Drain stat may be 0 if the worker happened to finish before our get(),
+    // but the freshness check above is the real correctness gate. We only
+    // assert it's well-defined (>= 0 trivially) so the build-time stat exists.
+    EXPECT_GE(cache.stats().miss_drain_waits.load(), 0u);
+}
+
+TEST(TieredCacheAsyncFlushTest, DrainAsyncFlushesWithoutNewDirtyIsImmediate) {
+    TempDir tmp;
+    auto store = share(make_store_with_moments(tmp.path() / "store", 8, false));
+    ASSERT_NE(store, nullptr);
+    TieredCache::Config cfg; cfg.capacity_blocks = 4;
+    TieredCache cache(store, cfg);
+
+    // Nothing dirty, nothing in flight — drain returns immediately and without error.
+    auto dr = cache.drain_async_flushes();
+    EXPECT_TRUE(dr.has_value()) << dr.error();
+
+    // A purely clean read+evict cycle also leaves the async queue empty.
+    for (std::size_t b = 0; b < 6; ++b) {
+        ASSERT_TRUE(cache.get(b).has_value());
+        cache.unpin(b, /*dirty=*/false);
+    }
+    EXPECT_TRUE(cache.drain_async_flushes().has_value());
+    EXPECT_EQ(cache.stats().async_dirty_evictions.load(), 0u);
+}
+
+TEST(TieredCacheAsyncFlushTest, EvictDirtyMomentsRegionPersistsAcrossDrain) {
+    TempDir tmp;
+    auto store = share(make_store_with_moments(tmp.path() / "store", 8, true));
+    ASSERT_NE(store, nullptr);
+    TieredCache::Config cfg; cfg.capacity_blocks = 2;
+    TieredCache cache(store, cfg);
+
+    // Mutate ONLY the moments region of block 0.
+    ASSERT_TRUE(cache.get(0).has_value());
+    {
+        auto mw = cache.pin_moments_for_write(0);
+        ASSERT_TRUE(mw.has_value()) << mw.error();
+        std::fill(mw.value().begin(), mw.value().end(), std::byte{0xD4});
+    }
+    cache.unpin(0, /*dirty=*/false); // data wasn't touched
+
+    // Evict block 0 via cache pressure.
+    for (std::size_t b : {1u, 2u}) {
+        ASSERT_TRUE(cache.get(b).has_value());
+        cache.unpin(b, /*dirty=*/false);
+    }
+    ASSERT_TRUE(cache.flush_dirty().has_value());
+
+    std::vector<std::byte> buf(store->moments_bytes_per_block());
+    ASSERT_TRUE(store->read_moments(0, std::span<std::byte>(buf)).has_value());
+    for (std::size_t i = 0; i < buf.size(); ++i) {
+        ASSERT_EQ(buf[i], std::byte{0xD4}) << "moments byte " << i << " not flushed";
+    }
+}
+
+TEST(TieredCacheAsyncFlushTest, HighWatermarkAppliesBackpressureOnBurstEviction) {
+    TempDir tmp;
+    auto store = share(make_store_with_moments(tmp.path() / "store", 16, false));
+    ASSERT_NE(store, nullptr);
+
+    TieredCache::Config cfg;
+    cfg.capacity_blocks = 2;
+    cfg.flush_queue_high_watermark = 1; // force backpressure on every other evict
+    TieredCache cache(store, cfg);
+
+    // Dirty many distinct blocks then evict them by churning others. Each
+    // eviction enqueues 1 data flush job; the second enqueue must observe
+    // queue size >= watermark and block until the worker drains one slot.
+    const std::size_t kDirty = 8;
+    for (std::size_t b = 0; b < kDirty; ++b) {
+        auto w = cache.pin_for_write(b);
+        ASSERT_TRUE(w.has_value()) << w.error();
+        // Write the block id byte across the slot so we can later verify which one persisted.
+        std::fill(w.value().begin(), w.value().end(), static_cast<std::byte>(b & 0xFF));
+        cache.unpin(b, /*dirty=*/true);
+    }
+    // Force evictions by reading more clean blocks past capacity.
+    for (std::size_t b = kDirty; b < kDirty + 4; ++b) {
+        ASSERT_TRUE(cache.get(b).has_value());
+        cache.unpin(b, /*dirty=*/false);
+    }
+
+    ASSERT_TRUE(cache.flush_dirty().has_value());
+
+    // Backpressure must have been hit at least once.
+    EXPECT_GE(cache.stats().backpressure_waits.load(), 1u);
+
+    // All dirty bytes must be on the store.
+    for (std::size_t b = 0; b < kDirty; ++b) {
+        std::vector<std::byte> buf(store->bytes_per_block());
+        ASSERT_TRUE(store->read_block(b, std::span<std::byte>(buf)).has_value());
+        const auto expected = static_cast<std::byte>(b & 0xFF);
+        for (std::size_t i = 0; i < buf.size(); ++i) {
+            ASSERT_EQ(buf[i], expected) << "block " << b << " byte " << i;
+        }
+    }
+}
+
