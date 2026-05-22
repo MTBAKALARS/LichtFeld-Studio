@@ -123,6 +123,20 @@ namespace lfs::training {
         /// Access the attached WorkingSet (may be null).
         tide::WorkingSet* get_working_set() noexcept;
 
+        // Phase 3.5.3e-2 test accessors ------------------------------------
+        /// Bytes allocated for per-block Adam moments SOA scratch (sum of
+        /// 12 buffers: 6 m_* + 6 v_*). Zero when the attached WorkingSet
+        /// has `moments_bytes_per_block() == 0` (legacy v1 path) or before
+        /// `initialize()` runs.
+        std::size_t soa_moments_scratch_bytes() const noexcept;
+        /// Number of blocks the most recent `step()` iterated over. Zero on
+        /// the legacy v1 path (moments disabled) or before any step.
+        std::size_t last_step_block_count() const noexcept;
+        /// Per-block Adam step counter for `block_id`. Returns 0 if the block
+        /// has never been stepped. In-process only (no checkpoint persistence
+        /// until Phase 3.5.7).
+        std::int64_t block_step_count(std::size_t block_id) const noexcept;
+
         // Phase 3.5.2 test accessors --------------------------------------
         /// Number of blocks the most recent `pre_forward` call selected as
         /// visible. 0 before the first call, or when sources are missing.

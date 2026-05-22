@@ -34,6 +34,7 @@
 #include <ostream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 
 namespace lfs::training {
@@ -69,6 +70,47 @@ namespace lfs::training {
                 return 0;
             const std::size_t total = static_cast<std::size_t>(sh_degree + 1) * static_cast<std::size_t>(sh_degree + 1);
             return (total - 1) * 3;
+        }
+
+        // Phase 3.5.3e-2 helpers ------------------------------------------
+        // Build SoaViews / MomentsSoaViews that point at the per-block slice
+        // (gaussians [local_idx*g, (local_idx+1)*g) of the bulk SOA scratch,
+        // for use with the existing aos_to_soa / soa_to_aos / moments_aos_to_soa
+        // / moments_soa_to_aos kernels.
+        tide::SoaViews per_block_data_views(float* d_means, float* d_scaling,
+                                            float* d_rotation, float* d_opacity,
+                                            float* d_sh0, float* d_shN,
+                                            std::size_t local_idx, std::size_t g,
+                                            std::size_t shN_floats) {
+            const std::size_t off = local_idx * g;
+            return tide::SoaViews{
+                d_means + off * 3,
+                d_scaling + off * 3,
+                d_rotation + off * 4,
+                d_opacity + off,
+                d_sh0 + off * 3,
+                d_shN == nullptr ? nullptr : d_shN + off * shN_floats,
+                g, shN_floats};
+        }
+
+        tide::MomentsSoaViews per_block_moments_views(
+            float* d_m_means, float* d_m_scaling, float* d_m_rotation,
+            float* d_m_opacity, float* d_m_sh0, float* d_m_shN,
+            float* d_v_means, float* d_v_scaling, float* d_v_rotation,
+            float* d_v_opacity, float* d_v_sh0, float* d_v_shN,
+            std::size_t local_idx, std::size_t g, std::size_t shN_floats) {
+            const std::size_t off = local_idx * g;
+            tide::SoaViews m{
+                d_m_means + off * 3, d_m_scaling + off * 3, d_m_rotation + off * 4,
+                d_m_opacity + off, d_m_sh0 + off * 3,
+                d_m_shN == nullptr ? nullptr : d_m_shN + off * shN_floats,
+                g, shN_floats};
+            tide::SoaViews v{
+                d_v_means + off * 3, d_v_scaling + off * 3, d_v_rotation + off * 4,
+                d_v_opacity + off, d_v_sh0 + off * 3,
+                d_v_shN == nullptr ? nullptr : d_v_shN + off * shN_floats,
+                g, shN_floats};
+            return tide::MomentsSoaViews{m, v};
         }
 
     } // namespace
@@ -150,6 +192,41 @@ namespace lfs::training {
         // to skip a redundant load when the resident set is unchanged.
         std::vector<std::size_t> last_loaded_ids;
 
+        // Phase 3.5.3e-2: per-block Adam moments SOA scratch. Only allocated
+        // when the attached WorkingSet has `moments_bytes_per_block > 0` (v2
+        // store). Mirrors the data SOA layout exactly, with TWO copies per
+        // attribute (m and v) so step_external_moments can read/write moments
+        // directly without an extra D2D pass. Sized to `soa_capacity`.
+        float* d_m_means = nullptr;
+        float* d_m_scaling = nullptr;
+        float* d_m_rotation = nullptr;
+        float* d_m_opacity = nullptr;
+        float* d_m_sh0 = nullptr;
+        float* d_m_shN = nullptr;
+        float* d_v_means = nullptr;
+        float* d_v_scaling = nullptr;
+        float* d_v_rotation = nullptr;
+        float* d_v_opacity = nullptr;
+        float* d_v_sh0 = nullptr;
+        float* d_v_shN = nullptr;
+        std::size_t moments_scratch_bytes = 0;
+
+        // Cached at initialize when a WorkingSet is attached:
+        // bytes_per_block / kAosBytesPerGaussian. Drives per-slot offsets in
+        // the v2 pre_step/step paths.
+        std::size_t g_per_block = 0;
+
+        // Phase 3.5.3e-2: per-block Adam step counter, keyed by global block_id.
+        // In-process only — 3.5.7 will persist it next to the moments sidecar
+        // so resume restores it. operator[]'s default zero-init is the
+        // "fresh block" signal; the v2 step path increments to >=1 before
+        // calling step_external_moments.
+        std::unordered_map<std::size_t, std::int64_t> block_step_counts;
+
+        // Telemetry: number of blocks the most recent v2 step iterated over.
+        // Zero on the legacy v1 path (moments disabled).
+        std::size_t last_step_block_count = 0;
+
         void free_scratch() noexcept {
             const std::array<float**, 6> ptrs{&d_means, &d_scaling, &d_rotation,
                                               &d_opacity, &d_sh0, &d_shN};
@@ -160,6 +237,19 @@ namespace lfs::training {
                 }
             }
             scratch_bytes = 0;
+        }
+
+        void free_moments_scratch() noexcept {
+            const std::array<float**, 12> ptrs{
+                &d_m_means, &d_m_scaling, &d_m_rotation, &d_m_opacity, &d_m_sh0, &d_m_shN,
+                &d_v_means, &d_v_scaling, &d_v_rotation, &d_v_opacity, &d_v_sh0, &d_v_shN};
+            for (auto* slot : ptrs) {
+                if (*slot != nullptr) {
+                    cudaFree(*slot);
+                    *slot = nullptr;
+                }
+            }
+            moments_scratch_bytes = 0;
         }
     };
 
@@ -180,6 +270,7 @@ namespace lfs::training {
         impl_->scheduler.reset();
         impl_->optimizer.reset();
         impl_->splat_view.reset();
+        impl_->free_moments_scratch();
         impl_->free_scratch();
     }
 
@@ -235,6 +326,56 @@ namespace lfs::training {
         LOG_DEBUG("TideStrategy: allocated {} bytes of SOA scratch for {} Gaussians (SH degree {}, shN floats/g {}, working_set={})",
                   impl_->scratch_bytes, n, impl_->sh_degree, impl_->shN_floats,
                   impl_->working_set ? "attached" : "none");
+
+        // Phase 3.5.3e-2: allocate per-block Adam moments SOA scratch when
+        // the WorkingSet carries moments (v2 stores). When absent, the
+        // strategy stays on the Phase 3.4c bulk path with TideResidentAdam's
+        // internal m/v buffers and one shared step counter.
+        const bool moments_enabled = impl_->working_set &&
+                                     impl_->working_set->moments_bytes_per_block() > 0;
+        if (moments_enabled) {
+            impl_->g_per_block = impl_->working_set->config().bytes_per_block /
+                                 tide::kAosBytesPerGaussian;
+            // Sanity: each block's moments region must match the kernel's
+            // expected per-Gaussian moments stride (118 floats).
+            const std::size_t expected_mbpb =
+                impl_->g_per_block * tide::kAosMomentsBytesPerGaussian;
+            if (impl_->working_set->moments_bytes_per_block() != expected_mbpb) {
+                throw std::runtime_error(
+                    "TideStrategy::initialize: WorkingSet moments_bytes_per_block (" +
+                    std::to_string(impl_->working_set->moments_bytes_per_block()) +
+                    ") does not equal g_per_block * kAosMomentsBytesPerGaussian (" +
+                    std::to_string(expected_mbpb) + ")");
+            }
+
+            auto alloc_pair = [n](float** dst_m, float** dst_v, std::size_t per_g) {
+                const std::size_t count = n * per_g;
+                if (count == 0) return;
+                *dst_m = cuda_alloc_floats(count);
+                *dst_v = cuda_alloc_floats(count);
+                const auto e1 = cudaMemset(*dst_m, 0, count * sizeof(float));
+                if (e1 != cudaSuccess) {
+                    throw std::runtime_error(cuda_err("cudaMemset(m scratch)", e1));
+                }
+                const auto e2 = cudaMemset(*dst_v, 0, count * sizeof(float));
+                if (e2 != cudaSuccess) {
+                    throw std::runtime_error(cuda_err("cudaMemset(v scratch)", e2));
+                }
+            };
+            alloc_pair(&impl_->d_m_means,    &impl_->d_v_means,    3);
+            alloc_pair(&impl_->d_m_scaling,  &impl_->d_v_scaling,  3);
+            alloc_pair(&impl_->d_m_rotation, &impl_->d_v_rotation, 4);
+            alloc_pair(&impl_->d_m_opacity,  &impl_->d_v_opacity,  1);
+            alloc_pair(&impl_->d_m_sh0,      &impl_->d_v_sh0,      3);
+            if (impl_->shN_floats != 0) {
+                alloc_pair(&impl_->d_m_shN, &impl_->d_v_shN, impl_->shN_floats);
+            }
+            impl_->moments_scratch_bytes = 2u * impl_->scratch_bytes;
+
+            LOG_INFO("TideStrategy: allocated {} bytes of per-block Adam moments SOA scratch "
+                     "(12 buffers, g_per_block={}, mirrors data SOA layout)",
+                     impl_->moments_scratch_bytes, impl_->g_per_block);
+        }
 
         // Bootstrap. When a WorkingSet is attached the SOA scratch will be
         // populated by pre_step()'s aos_to_soa() on the first iteration, so a
@@ -476,20 +617,74 @@ namespace lfs::training {
         }
         const std::size_t n = std::min(active_n, impl_->soa_capacity);
 
-        const auto* aos = static_cast<const float*>(impl_->working_set->device_buffer());
-        if (aos == nullptr) {
-            throw std::runtime_error("TideStrategy::pre_step: WorkingSet has no active device buffer");
+        const bool moments_enabled = impl_->working_set->moments_bytes_per_block() > 0;
+
+        if (!moments_enabled) {
+            // Legacy v1 bulk path: slot_bytes == bytes_per_block, so the
+            // active buffer is a contiguous AOS of `active_n` Gaussians.
+            const auto* aos = static_cast<const float*>(impl_->working_set->device_buffer());
+            if (aos == nullptr) {
+                throw std::runtime_error("TideStrategy::pre_step: WorkingSet has no active device buffer");
+            }
+            tide::SoaViews views{
+                impl_->d_means, impl_->d_scaling, impl_->d_rotation,
+                impl_->d_opacity, impl_->d_sh0, impl_->d_shN,
+                n, impl_->shN_floats};
+            const int rc = tide::aos_to_soa(aos, views, /*stream=*/nullptr);
+            if (rc != 0) {
+                throw std::runtime_error(
+                    "TideStrategy::pre_step: aos_to_soa launch failed: " +
+                    std::string(cudaGetErrorString(static_cast<cudaError_t>(rc))));
+            }
+            return;
         }
 
-        tide::SoaViews views{
-            impl_->d_means, impl_->d_scaling, impl_->d_rotation,
-            impl_->d_opacity, impl_->d_sh0, impl_->d_shN,
-            n, impl_->shN_floats};
-        const int rc = tide::aos_to_soa(aos, views, /*stream=*/nullptr);
-        if (rc != 0) {
-            throw std::runtime_error(
-                "TideStrategy::pre_step: aos_to_soa launch failed: " +
-                std::string(cudaGetErrorString(static_cast<cudaError_t>(rc))));
+        // Phase 3.5.3e-2 v2 path: per-slot iteration. The per-slot stride is
+        // `bytes_per_block + moments_bytes_per_block`, so a single bulk
+        // aos_to_soa would mis-read the interleaved moments bytes as data.
+        // We launch one aos_to_soa + one moments_aos_to_soa per active slot,
+        // scattering into the matching per-block range of the bulk SOA / m,v
+        // moments SOA scratch.
+        const auto* base = static_cast<const std::byte*>(impl_->working_set->device_buffer());
+        if (base == nullptr) {
+            throw std::runtime_error("TideStrategy::pre_step: WorkingSet has no active device buffer");
+        }
+        const std::size_t slot_bytes = impl_->working_set->slot_bytes();
+        const std::size_t g = impl_->g_per_block;
+        const auto slices = impl_->working_set->active_slices();
+        for (const auto& s : slices) {
+            const float* slot_data = reinterpret_cast<const float*>(base + s.local_index * slot_bytes);
+            tide::SoaViews dview = per_block_data_views(
+                impl_->d_means, impl_->d_scaling, impl_->d_rotation,
+                impl_->d_opacity, impl_->d_sh0, impl_->d_shN,
+                s.local_index, g, impl_->shN_floats);
+            const int rc1 = tide::aos_to_soa(slot_data, dview, /*stream=*/nullptr);
+            if (rc1 != 0) {
+                throw std::runtime_error(
+                    "TideStrategy::pre_step: per-block aos_to_soa launch failed at slot " +
+                    std::to_string(s.local_index) + ": " +
+                    std::string(cudaGetErrorString(static_cast<cudaError_t>(rc1))));
+            }
+
+            const float* slot_moments = impl_->working_set->moments_device_buffer(s.local_index);
+            if (slot_moments == nullptr) {
+                throw std::runtime_error(
+                    "TideStrategy::pre_step: missing moments buffer at slot " +
+                    std::to_string(s.local_index));
+            }
+            tide::MomentsSoaViews mv = per_block_moments_views(
+                impl_->d_m_means, impl_->d_m_scaling, impl_->d_m_rotation,
+                impl_->d_m_opacity, impl_->d_m_sh0, impl_->d_m_shN,
+                impl_->d_v_means, impl_->d_v_scaling, impl_->d_v_rotation,
+                impl_->d_v_opacity, impl_->d_v_sh0, impl_->d_v_shN,
+                s.local_index, g, impl_->shN_floats);
+            const int rc2 = tide::moments_aos_to_soa(slot_moments, mv, /*stream=*/nullptr);
+            if (rc2 != 0) {
+                throw std::runtime_error(
+                    "TideStrategy::pre_step: per-block moments_aos_to_soa launch failed at slot " +
+                    std::to_string(s.local_index) + ": " +
+                    std::string(cudaGetErrorString(static_cast<cudaError_t>(rc2))));
+            }
         }
     }
 
@@ -515,10 +710,6 @@ namespace lfs::training {
             return;
         }
 
-        // Phase 3.3a: route the actual Adam step through TideResidentAdam over
-        // the SOA scratch, then repack SOA back into the active AOS buffer.
-        // The held AdamOptimizer is only used as a grad-buffer host (its
-        // `step()` is intentionally NOT called on this path).
         const std::size_t active_n = impl_->working_set->active_gaussian_count();
         if (active_n == 0) {
             LOG_WARN("TideStrategy::step: working set has 0 active Gaussians; skipping");
@@ -526,55 +717,161 @@ namespace lfs::training {
         }
         const std::size_t n = std::min(active_n, impl_->soa_capacity);
 
-        struct ParamRoute {
-            ParamType type;
-            float* param_ptr;
-            std::size_t num_elements;
-        };
-        const std::array<ParamRoute, 6> routes{{
-            {ParamType::Means,    impl_->d_means,    n * 3},
-            {ParamType::Sh0,      impl_->d_sh0,      n * 3},
-            {ParamType::ShN,      impl_->d_shN,      n * impl_->shN_floats},
-            {ParamType::Scaling,  impl_->d_scaling,  n * 3},
-            {ParamType::Rotation, impl_->d_rotation, n * 4},
-            {ParamType::Opacity,  impl_->d_opacity,  n * 1},
-        }};
-        for (const auto& r : routes) {
-            if (r.param_ptr == nullptr || r.num_elements == 0) continue;
-            auto& grad_tensor = impl_->optimizer->get_grad(r.type);
-            if (!grad_tensor.is_valid()) {
-                LOG_WARN("TideStrategy::step: grad tensor for ParamType {} is invalid; skipping", static_cast<int>(r.type));
-                continue;
+        const bool moments_enabled = impl_->working_set->moments_bytes_per_block() > 0;
+        impl_->last_step_block_count = 0;
+
+        if (!moments_enabled) {
+            // Phase 3.3a legacy path: TideResidentAdam owns m/v internally,
+            // one shared per-type step counter, bulk SOA in/out.
+            struct ParamRoute {
+                ParamType type;
+                float* param_ptr;
+                std::size_t num_elements;
+            };
+            const std::array<ParamRoute, 6> routes{{
+                {ParamType::Means,    impl_->d_means,    n * 3},
+                {ParamType::Sh0,      impl_->d_sh0,      n * 3},
+                {ParamType::ShN,      impl_->d_shN,      n * impl_->shN_floats},
+                {ParamType::Scaling,  impl_->d_scaling,  n * 3},
+                {ParamType::Rotation, impl_->d_rotation, n * 4},
+                {ParamType::Opacity,  impl_->d_opacity,  n * 1},
+            }};
+            for (const auto& r : routes) {
+                if (r.param_ptr == nullptr || r.num_elements == 0) continue;
+                auto& grad_tensor = impl_->optimizer->get_grad(r.type);
+                if (!grad_tensor.is_valid()) {
+                    LOG_WARN("TideStrategy::step: grad tensor for ParamType {} is invalid; skipping", static_cast<int>(r.type));
+                    continue;
+                }
+                const auto result = impl_->resident_adam->step(
+                    r.type, r.param_ptr, grad_tensor.ptr<float>(),
+                    r.num_elements, iter);
+                if (!result.has_value()) {
+                    throw std::runtime_error(
+                        "TideStrategy::step: TideResidentAdam::step failed for ParamType " +
+                        std::to_string(static_cast<int>(r.type)) + ": " + result.error());
+                }
             }
-            const auto result = impl_->resident_adam->step(
-                r.type, r.param_ptr, grad_tensor.ptr<float>(),
-                r.num_elements, iter);
-            if (!result.has_value()) {
+
+            auto* aos = static_cast<float*>(impl_->working_set->mutable_device_buffer());
+            if (aos == nullptr) {
+                throw std::runtime_error("TideStrategy::step: WorkingSet has no mutable device buffer");
+            }
+            tide::SoaViews views{
+                impl_->d_means, impl_->d_scaling, impl_->d_rotation,
+                impl_->d_opacity, impl_->d_sh0, impl_->d_shN,
+                n, impl_->shN_floats};
+            const int rc = tide::soa_to_aos(views, aos, /*stream=*/nullptr);
+            if (rc != 0) {
                 throw std::runtime_error(
-                    "TideStrategy::step: TideResidentAdam::step failed for ParamType " +
-                    std::to_string(static_cast<int>(r.type)) + ": " + result.error());
+                    "TideStrategy::step: soa_to_aos launch failed: " +
+                    std::string(cudaGetErrorString(static_cast<cudaError_t>(rc))));
             }
+
+            impl_->optimizer->zero_grad(iter);
+            impl_->scheduler->step();
+            return;
         }
 
-        // Repack SOA -> AOS so the resident bytes in the active buffer
-        // reflect the post-Adam parameters. Phase 3.3b will mark these blocks
-        // dirty so the next prefetch writes them back to TieredCache.
-        auto* aos = static_cast<float*>(impl_->working_set->mutable_device_buffer());
-        if (aos == nullptr) {
+        // Phase 3.5.3e-2 v2 path: per-block Adam through step_external_moments.
+        // The held TideResidentAdam's internal m/v are bypassed; each block's
+        // m/v live in the WorkingSet moments slot (which travels with the
+        // block on evict/re-admit, per Phase 3.5.3b round-trip), staged
+        // through this strategy's per-attribute SOA m/v scratch.
+        auto* base = static_cast<std::byte*>(impl_->working_set->mutable_device_buffer());
+        if (base == nullptr) {
             throw std::runtime_error("TideStrategy::step: WorkingSet has no mutable device buffer");
         }
-        tide::SoaViews views{
-            impl_->d_means, impl_->d_scaling, impl_->d_rotation,
-            impl_->d_opacity, impl_->d_sh0, impl_->d_shN,
-            n, impl_->shN_floats};
-        const int rc = tide::soa_to_aos(views, aos, /*stream=*/nullptr);
-        if (rc != 0) {
-            throw std::runtime_error(
-                "TideStrategy::step: soa_to_aos launch failed: " +
-                std::string(cudaGetErrorString(static_cast<cudaError_t>(rc))));
+        const std::size_t slot_bytes = impl_->working_set->slot_bytes();
+        const std::size_t g = impl_->g_per_block;
+        const auto slices = impl_->working_set->active_slices();
+
+        struct ParamRoute {
+            ParamType type;
+            float* param_base;
+            float* m_base;
+            float* v_base;
+            std::size_t per_g;
+        };
+        const std::array<ParamRoute, 6> routes{{
+            {ParamType::Means,    impl_->d_means,    impl_->d_m_means,    impl_->d_v_means,    3},
+            {ParamType::Sh0,      impl_->d_sh0,      impl_->d_m_sh0,      impl_->d_v_sh0,      3},
+            {ParamType::ShN,      impl_->d_shN,      impl_->d_m_shN,      impl_->d_v_shN,      impl_->shN_floats},
+            {ParamType::Scaling,  impl_->d_scaling,  impl_->d_m_scaling,  impl_->d_v_scaling,  3},
+            {ParamType::Rotation, impl_->d_rotation, impl_->d_m_rotation, impl_->d_v_rotation, 4},
+            {ParamType::Opacity,  impl_->d_opacity,  impl_->d_m_opacity,  impl_->d_v_opacity,  1},
+        }};
+
+        for (const auto& s : slices) {
+            const std::size_t local = s.local_index;
+            const std::size_t off_g = local * g;
+
+            // Bump per-block step counter (1-based, matches contract).
+            auto& counter = impl_->block_step_counts[s.block_id];
+            ++counter;
+            const std::int64_t block_step = counter;
+
+            for (const auto& r : routes) {
+                if (r.param_base == nullptr || r.per_g == 0) continue;
+                auto& grad_tensor = impl_->optimizer->get_grad(r.type);
+                if (!grad_tensor.is_valid()) continue;
+                float* param_slice = r.param_base + off_g * r.per_g;
+                float* grad_slice  = grad_tensor.ptr<float>() + off_g * r.per_g;
+                float* m_slice     = r.m_base + off_g * r.per_g;
+                float* v_slice     = r.v_base + off_g * r.per_g;
+                const std::size_t num = g * r.per_g;
+                const auto result = impl_->resident_adam->step_external_moments(
+                    r.type, param_slice, grad_slice, m_slice, v_slice,
+                    num, block_step, iter);
+                if (!result.has_value()) {
+                    throw std::runtime_error(
+                        "TideStrategy::step: step_external_moments failed at slot " +
+                        std::to_string(local) + " (block " + std::to_string(s.block_id) +
+                        ") for ParamType " + std::to_string(static_cast<int>(r.type)) +
+                        ": " + result.error());
+                }
+            }
+
+            // Repack this block's SOA → AOS (data + moments).
+            float* slot_data = reinterpret_cast<float*>(base + local * slot_bytes);
+            tide::SoaViews dview = per_block_data_views(
+                impl_->d_means, impl_->d_scaling, impl_->d_rotation,
+                impl_->d_opacity, impl_->d_sh0, impl_->d_shN,
+                local, g, impl_->shN_floats);
+            const int rc1 = tide::soa_to_aos(dview, slot_data, /*stream=*/nullptr);
+            if (rc1 != 0) {
+                throw std::runtime_error(
+                    "TideStrategy::step: per-block soa_to_aos failed at slot " +
+                    std::to_string(local) + ": " +
+                    std::string(cudaGetErrorString(static_cast<cudaError_t>(rc1))));
+            }
+
+            float* slot_moments = impl_->working_set->moments_device_buffer(local);
+            if (slot_moments == nullptr) {
+                throw std::runtime_error(
+                    "TideStrategy::step: missing moments buffer at slot " + std::to_string(local));
+            }
+            tide::MomentsSoaViews mv = per_block_moments_views(
+                impl_->d_m_means, impl_->d_m_scaling, impl_->d_m_rotation,
+                impl_->d_m_opacity, impl_->d_m_sh0, impl_->d_m_shN,
+                impl_->d_v_means, impl_->d_v_scaling, impl_->d_v_rotation,
+                impl_->d_v_opacity, impl_->d_v_sh0, impl_->d_v_shN,
+                local, g, impl_->shN_floats);
+            const int rc2 = tide::moments_soa_to_aos(mv, slot_moments, /*stream=*/nullptr);
+            if (rc2 != 0) {
+                throw std::runtime_error(
+                    "TideStrategy::step: per-block moments_soa_to_aos failed at slot " +
+                    std::to_string(local) + ": " +
+                    std::string(cudaGetErrorString(static_cast<cudaError_t>(rc2))));
+            }
+
+            // Both regions just got fresh device-side values; mark dirty so
+            // the next eviction writes them back to TieredCache + BlockStore
+            // (the round-trip primitive landed in Phase 3.5.3b).
+            impl_->working_set->mark_dirty(local, /*data=*/true, /*moments=*/true);
         }
 
-        // Clear grads + advance scheduler (matching MCMC::step semantics).
+        impl_->last_step_block_count = slices.size();
         impl_->optimizer->zero_grad(iter);
         impl_->scheduler->step();
     }
@@ -673,6 +970,20 @@ namespace lfs::training {
 
     tide::WorkingSet* TideStrategy::get_working_set() noexcept {
         return impl_ ? impl_->working_set.get() : nullptr;
+    }
+
+    std::size_t TideStrategy::soa_moments_scratch_bytes() const noexcept {
+        return impl_ ? impl_->moments_scratch_bytes : 0u;
+    }
+
+    std::size_t TideStrategy::last_step_block_count() const noexcept {
+        return impl_ ? impl_->last_step_block_count : 0u;
+    }
+
+    std::int64_t TideStrategy::block_step_count(std::size_t block_id) const noexcept {
+        if (!impl_) return 0;
+        const auto it = impl_->block_step_counts.find(block_id);
+        return it == impl_->block_step_counts.end() ? std::int64_t{0} : it->second;
     }
 
     void TideStrategy::set_working_set(std::shared_ptr<tide::WorkingSet> working_set) {
