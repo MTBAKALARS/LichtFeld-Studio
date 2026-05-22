@@ -69,17 +69,25 @@ namespace lfs::training::tide {
         struct Config {
             std::size_t capacity_blocks = 0;     ///< Hard cap on resident block count per buffer in VRAM
             std::size_t bytes_per_block = 0;     ///< Must match BlockStore::bytes_per_block()
+            /// Per-block byte stride of the Adam moments region inside each slot.
+            /// 0 = no moments (legacy v1 stores). When non-zero, each slot grows
+            /// to `bytes_per_block + moments_bytes_per_block` and the WorkingSet
+            /// loads/retains/writes-back the moments region in tandem with the
+            /// parameter region. Must equal `BlockStore::moments_bytes_per_block()`.
+            std::size_t moments_bytes_per_block = 0;
             int cuda_device = 0;                 ///< GPU index for cudaSetDevice
         };
 
         struct Stats {
-            std::uint64_t loads            = 0;  ///< Number of completed load_and_activate cycles
-            std::uint64_t prefetches       = 0;  ///< Number of prefetch() calls issued
-            std::uint64_t activates        = 0;  ///< Number of wait_and_activate() calls completed
-            std::uint64_t blocks_uploaded  = 0;  ///< Blocks H2D-copied from pinned host
-            std::uint64_t bytes_uploaded   = 0;  ///< Bytes H2D-copied from pinned host
-            std::uint64_t blocks_retained  = 0;  ///< Blocks already resident from prior frame (D2D-copied)
-            std::uint64_t bytes_d2d_copied = 0;  ///< Bytes D2D-copied for retention across the A/B swap
+            std::uint64_t loads               = 0;  ///< Number of completed load_and_activate cycles
+            std::uint64_t prefetches          = 0;  ///< Number of prefetch() calls issued
+            std::uint64_t activates           = 0;  ///< Number of wait_and_activate() calls completed
+            std::uint64_t blocks_uploaded     = 0;  ///< Blocks H2D-copied from pinned host
+            std::uint64_t bytes_uploaded      = 0;  ///< Bytes H2D-copied from pinned host (data + moments)
+            std::uint64_t blocks_retained     = 0;  ///< Blocks already resident from prior frame (D2D-copied)
+            std::uint64_t bytes_d2d_copied    = 0;  ///< Bytes D2D-copied for retention across the A/B swap
+            std::uint64_t blocks_written_back = 0;  ///< Dirty blocks D2H-copied to cache on eviction
+            std::uint64_t bytes_written_back  = 0;  ///< Bytes D2H-copied to cache on eviction (data + moments regions combined)
         };
 
         ~WorkingSet();
@@ -159,6 +167,45 @@ namespace lfs::training::tide {
         /// that need to update the resident bytes in place before the next prefetch.
         /// Callers must NOT outlive the next @ref wait_and_activate() call.
         void* mutable_device_buffer() noexcept;
+
+        /// Per-Gaussian byte stride of the Adam moments region (0 if absent).
+        std::size_t moments_bytes_per_block() const noexcept { return config_.moments_bytes_per_block; }
+
+        /// Per-slot byte stride: `bytes_per_block + moments_bytes_per_block`.
+        /// The active device buffer is laid out as `capacity_blocks` consecutive
+        /// slots of this size, with the data region first and the moments region
+        /// (if present) immediately after.
+        std::size_t slot_bytes() const noexcept {
+            return config_.bytes_per_block + config_.moments_bytes_per_block;
+        }
+
+        /**
+         * @brief Mutable device pointer to a particular slot's Adam moments region.
+         *
+         * @param local_idx The slot index, as exposed via @ref BlockSlice::local_index.
+         * @return float* into device memory, sized for @ref moments_bytes_per_block()
+         *         bytes; or nullptr if the working set has no moments region.
+         *
+         * Callers must NOT outlive the next @ref wait_and_activate() call (the
+         * A/B swap will move the pointer to the other buffer).
+         */
+        float* moments_device_buffer(std::size_t local_idx) noexcept;
+        const float* moments_device_buffer(std::size_t local_idx) const noexcept;
+
+        /**
+         * @brief Mark a slot as dirty so the next @ref prefetch that evicts it
+         *        writes the dirty region(s) back to the @ref TieredCache.
+         *
+         * Dirty flags persist across A/B retain (a dirty slot that survives a
+         * prefetch as a retained block stays dirty in the new active buffer).
+         * They are cleared in @ref wait_and_activate after the writeback completes.
+         *
+         * @param local_idx Slot index in the currently active buffer.
+         * @param data_dirty If true, the data region is written back on eviction.
+         * @param moments_dirty If true, the moments region is written back. Must
+         *                      be false when the working set has no moments region.
+         */
+        void mark_dirty(std::size_t local_idx, bool data_dirty, bool moments_dirty);
 
         /// Per-resident-block slice table, in the order the rasterizer should see them.
         std::span<const BlockSlice> active_slices() const noexcept;

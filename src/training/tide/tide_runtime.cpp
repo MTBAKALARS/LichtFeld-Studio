@@ -66,9 +66,14 @@ namespace lfs::training::tide {
         auto cache = std::make_unique<lfs::core::TieredCache>(store, ccfg);
 
         // 4) Build WorkingSet sized from store->bytes_per_block.
+        // If the store carries an Adam moments sidecar (manifest v2), each
+        // WorkingSet slot is grown to fit the moments region so prefetch /
+        // evict moves both regions atomically. Legacy v1 stores leave this
+        // at 0 and the slot stride degenerates to bytes_per_block.
         WorkingSet::Config wcfg;
         wcfg.capacity_blocks = ws_capacity;
         wcfg.bytes_per_block = store->bytes_per_block();
+        wcfg.moments_bytes_per_block = store->moments_bytes_per_block();
         wcfg.cuda_device = 0;
         auto ws_result = WorkingSet::create(wcfg);
         if (!ws_result) {

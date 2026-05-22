@@ -556,3 +556,96 @@ TEST(BlockStoreMomentsTest, RejectsBadSizes) {
     EXPECT_FALSE(store->read_moments(99, std::span<std::byte>(right)).has_value());
     EXPECT_FALSE(store->write_moments(99, std::span<const std::byte>(right)).has_value());
 }
+
+// ============================================================================
+// Phase 3.5.3b: TieredCache combined data+moments slot
+// ============================================================================
+
+TEST(TieredCacheMomentsTest, SlotIncludesMomentsRegion) {
+    TempDir tmp;
+    auto raw = make_store_with_moments(tmp.path() / "store", 4, true);
+    ASSERT_NE(raw, nullptr);
+    auto store = share(std::move(raw));
+
+    TieredCache::Config cfg;
+    cfg.capacity_blocks = 2;
+    TieredCache cache(store, cfg);
+
+    EXPECT_TRUE(cache.has_moments());
+    EXPECT_EQ(cache.moments_bytes_per_block(), store->moments_bytes_per_block());
+}
+
+TEST(TieredCacheMomentsTest, GetAndGetMomentsReturnDistinctSpans) {
+    TempDir tmp;
+    auto store = share(make_store_with_moments(tmp.path() / "store", 4, true));
+    ASSERT_NE(store, nullptr);
+    TieredCache::Config cfg; cfg.capacity_blocks = 2;
+    TieredCache cache(store, cfg);
+
+    auto data = cache.get(0);
+    ASSERT_TRUE(data.has_value()) << data.error();
+    auto moments = cache.get_moments(0);
+    ASSERT_TRUE(moments.has_value()) << moments.error();
+
+    EXPECT_EQ(data.value().size(), store->bytes_per_block());
+    EXPECT_EQ(moments.value().size(), store->moments_bytes_per_block());
+
+    // Moments span immediately follows the data span inside the same slot.
+    const auto* data_end = data.value().data() + data.value().size();
+    EXPECT_EQ(reinterpret_cast<const void*>(data_end),
+              reinterpret_cast<const void*>(moments.value().data()));
+
+    cache.unpin(0, /*dirty=*/false);
+}
+
+TEST(TieredCacheMomentsTest, PinMomentsForWriteFlushReachesStore) {
+    TempDir tmp;
+    auto store = share(make_store_with_moments(tmp.path() / "store", 4, true));
+    ASSERT_NE(store, nullptr);
+    TieredCache::Config cfg; cfg.capacity_blocks = 2;
+    TieredCache cache(store, cfg);
+
+    // Take a pin via get(), then upgrade moments to writable.
+    ASSERT_TRUE(cache.get(0).has_value());
+    auto mwrite = cache.pin_moments_for_write(0);
+    ASSERT_TRUE(mwrite.has_value()) << mwrite.error();
+    std::fill(mwrite.value().begin(), mwrite.value().end(), std::byte{0xC3});
+
+    // Unpin with dirty=false: data wasn't touched, moments dirty bit was set
+    // by pin_moments_for_write directly on the cache node.
+    cache.unpin(0, /*dirty=*/false);
+
+    ASSERT_TRUE(cache.flush_dirty().has_value());
+
+    std::vector<std::byte> buf(store->moments_bytes_per_block());
+    ASSERT_TRUE(store->read_moments(0, std::span<std::byte>(buf)).has_value());
+    for (std::size_t i = 0; i < buf.size(); ++i) {
+        ASSERT_EQ(buf[i], std::byte{0xC3}) << "byte " << i << " not flushed";
+    }
+}
+
+TEST(TieredCacheMomentsTest, MissPathReadsBothRegions) {
+    TempDir tmp;
+    const auto dir = tmp.path() / "store";
+    {
+        auto store = share(make_store_with_moments(dir, 4, true));
+        ASSERT_NE(store, nullptr);
+        std::vector<std::byte> pattern(store->moments_bytes_per_block(), std::byte{0x77});
+        ASSERT_TRUE(store->write_moments(1, std::span<const std::byte>(pattern)).has_value());
+    }
+    // Reopen in a fresh cache (forces a miss).
+    auto rstore = BlockStore::open(dir, BlockStore::Config{});
+    ASSERT_TRUE(rstore.has_value()) << rstore.error();
+    auto store = share(std::move(*rstore));
+
+    TieredCache::Config cfg; cfg.capacity_blocks = 2;
+    TieredCache cache(store, cfg);
+    ASSERT_TRUE(cache.get(1).has_value());
+    auto moments = cache.get_moments(1);
+    ASSERT_TRUE(moments.has_value()) << moments.error();
+    for (std::size_t i = 0; i < moments.value().size(); ++i) {
+        ASSERT_EQ(moments.value()[i], std::byte{0x77}) << "byte " << i;
+    }
+    cache.unpin(1, /*dirty=*/false);
+}
+

@@ -60,6 +60,8 @@ namespace lfs::core {
         : store_(std::move(store)),
           config_(config),
           bytes_per_block_(store_->bytes_per_block()),
+          moments_bytes_per_block_(store_->has_moments() ? store_->moments_bytes_per_block() : 0),
+          slot_bytes_(bytes_per_block_ + moments_bytes_per_block_),
           stats_(std::make_unique<Stats>()) {
 
         if (!store_) throw std::invalid_argument{"TieredCache: store must be non-null"};
@@ -73,7 +75,7 @@ namespace lfs::core {
             config_.pinned_pool_size_blocks = config_.capacity_blocks;
         }
 
-        pinned_pool_bytes_ = config_.pinned_pool_size_blocks * bytes_per_block_;
+        pinned_pool_bytes_ = config_.pinned_pool_size_blocks * slot_bytes_;
         pinned_pool_ = alloc_pinned(pinned_pool_bytes_);
         if (!pinned_pool_) {
             throw std::runtime_error{
@@ -84,15 +86,24 @@ namespace lfs::core {
 
         free_buffers_.reserve(config_.pinned_pool_size_blocks);
         for (std::size_t i = 0; i < config_.pinned_pool_size_blocks; ++i) {
-            free_buffers_.push_back(pinned_pool_ + i * bytes_per_block_);
+            free_buffers_.push_back(pinned_pool_ + i * slot_bytes_);
         }
 
         flush_thread_ = std::thread{[this] { flush_worker_(); }};
 
-        LOG_INFO("TieredCache: capacity={} blocks, pinned pool={:.2f} GiB ({} buffers)",
-                 config_.capacity_blocks,
-                 static_cast<double>(pinned_pool_bytes_) / (1ull << 30),
-                 config_.pinned_pool_size_blocks);
+        if (moments_bytes_per_block_ > 0) {
+            LOG_INFO("TieredCache: capacity={} blocks, pinned pool={:.2f} GiB ({} buffers, slot={} B data + {} B moments)",
+                     config_.capacity_blocks,
+                     static_cast<double>(pinned_pool_bytes_) / (1ull << 30),
+                     config_.pinned_pool_size_blocks,
+                     bytes_per_block_,
+                     moments_bytes_per_block_);
+        } else {
+            LOG_INFO("TieredCache: capacity={} blocks, pinned pool={:.2f} GiB ({} buffers)",
+                     config_.capacity_blocks,
+                     static_cast<double>(pinned_pool_bytes_) / (1ull << 30),
+                     config_.pinned_pool_size_blocks);
+        }
     }
 
     TieredCache::~TieredCache() {
@@ -148,6 +159,24 @@ namespace lfs::core {
             }
             return std::unexpected{r.error()};
         }
+        // If the store has a moments region, eagerly populate the moments half of
+        // the slot. Done synchronously alongside the data read so callers don't
+        // pay a second slow path on first get_moments().
+        if (moments_bytes_per_block_ > 0) {
+            if (auto r = store_->read_moments(
+                    block_id,
+                    std::span<std::byte>{node.buffer + bytes_per_block_, moments_bytes_per_block_});
+                !r) {
+                std::scoped_lock lk2(mutex_);
+                auto map_it = map_.find(block_id);
+                if (map_it != map_.end()) {
+                    release_buffer_(map_it->second->node->buffer);
+                    lru_list_.erase(map_it->second);
+                    map_.erase(map_it);
+                }
+                return std::unexpected{r.error()};
+            }
+        }
 
         return std::span<const std::byte>{node.buffer, bytes_per_block_};
     }
@@ -169,6 +198,53 @@ namespace lfs::core {
         }
         // Cast away const — the buffer was always writable; get() returned a const view by convention.
         return std::span<std::byte>{node.buffer, bytes_per_block_};
+    }
+
+    std::expected<std::span<const std::byte>, std::string>
+    TieredCache::get_moments(std::size_t block_id) {
+        if (moments_bytes_per_block_ == 0) {
+            return std::unexpected{"get_moments: cache has no moments region"};
+        }
+        std::scoped_lock lk(mutex_);
+        auto it = map_.find(block_id);
+        if (it == map_.end()) {
+            return std::unexpected{
+                std::format("get_moments: block {} is not resident (call get() first)", block_id)};
+        }
+        auto& node = *it->second->node;
+        if (node.pin_count == 0) {
+            return std::unexpected{
+                std::format("get_moments: block {} is not pinned (call get() first)", block_id)};
+        }
+        return std::span<const std::byte>{node.buffer + bytes_per_block_, moments_bytes_per_block_};
+    }
+
+    std::expected<std::span<std::byte>, std::string>
+    TieredCache::pin_moments_for_write(std::size_t block_id) {
+        if (moments_bytes_per_block_ == 0) {
+            return std::unexpected{"pin_moments_for_write: cache has no moments region"};
+        }
+        std::scoped_lock lk(mutex_);
+        auto it = map_.find(block_id);
+        if (it == map_.end()) {
+            return std::unexpected{
+                std::format("pin_moments_for_write: block {} is not resident "
+                            "(call get()/pin_for_write() first)",
+                            block_id)};
+        }
+        auto& node = *it->second->node;
+        if (node.pin_count == 0) {
+            return std::unexpected{
+                std::format("pin_moments_for_write: block {} is not pinned "
+                            "(call get()/pin_for_write() first)",
+                            block_id)};
+        }
+        if (!node.moments_dirty) {
+            node.moments_dirty = true;
+            // Dirty-block counter tracks data dirty; moments dirty doesn't bump it
+            // (a block can have moments-only dirty without data dirty).
+        }
+        return std::span<std::byte>{node.buffer + bytes_per_block_, moments_bytes_per_block_};
     }
 
     void TieredCache::unpin(std::size_t block_id, bool dirty) {
@@ -195,7 +271,7 @@ namespace lfs::core {
         auto it = lru_list_.begin();
         while (evicted < k && it != lru_list_.end()) {
             auto& node = *it->node;
-            if (node.pin_count == 0 && !node.dirty) {
+            if (node.pin_count == 0 && !node.dirty && !node.moments_dirty) {
                 release_buffer_(node.buffer);
                 map_.erase(node.block_id);
                 it = lru_list_.erase(it);
@@ -209,23 +285,40 @@ namespace lfs::core {
     }
 
     std::expected<void, std::string> TieredCache::flush_dirty() {
-        std::vector<std::size_t> to_flush;
-        std::vector<std::vector<std::byte>> payloads;
+        std::vector<std::size_t> data_ids;
+        std::vector<std::vector<std::byte>> data_payloads;
+        std::vector<std::size_t> moments_ids;
+        std::vector<std::vector<std::byte>> moments_payloads;
         {
             std::scoped_lock lk(mutex_);
             for (auto& entry : lru_list_) {
                 auto& node = *entry.node;
-                if (node.dirty && node.pin_count == 0) {
-                    to_flush.push_back(node.block_id);
-                    payloads.emplace_back(bytes_per_block_);
-                    std::memcpy(payloads.back().data(), node.buffer, bytes_per_block_);
+                if (node.pin_count != 0) continue;
+                if (node.dirty) {
+                    data_ids.push_back(node.block_id);
+                    data_payloads.emplace_back(bytes_per_block_);
+                    std::memcpy(data_payloads.back().data(), node.buffer, bytes_per_block_);
                     node.dirty = false;
                     stats_->dirty_blocks_resident.fetch_sub(1, std::memory_order_relaxed);
                 }
+                if (node.moments_dirty && moments_bytes_per_block_ > 0) {
+                    moments_ids.push_back(node.block_id);
+                    moments_payloads.emplace_back(moments_bytes_per_block_);
+                    std::memcpy(moments_payloads.back().data(),
+                                node.buffer + bytes_per_block_,
+                                moments_bytes_per_block_);
+                    node.moments_dirty = false;
+                }
             }
         }
-        for (std::size_t i = 0; i < to_flush.size(); ++i) {
-            if (auto r = store_->write_block(to_flush[i], payloads[i]); !r) {
+        for (std::size_t i = 0; i < data_ids.size(); ++i) {
+            if (auto r = store_->write_block(data_ids[i], data_payloads[i]); !r) {
+                return std::unexpected{r.error()};
+            }
+            stats_->sync_flushes.fetch_add(1, std::memory_order_relaxed);
+        }
+        for (std::size_t i = 0; i < moments_ids.size(); ++i) {
+            if (auto r = store_->write_moments(moments_ids[i], moments_payloads[i]); !r) {
                 return std::unexpected{r.error()};
             }
             stats_->sync_flushes.fetch_add(1, std::memory_order_relaxed);
@@ -268,24 +361,59 @@ namespace lfs::core {
             if (lru_list_.size() == before) {
                 // Couldn't evict anything — every resident block is pinned or dirty.
                 // Force a synchronous flush of the LRU dirty block to make progress.
+                // A block counts as "dirty" if either its data or moments region is dirty.
                 bool flushed_any = false;
                 for (auto it = lru_list_.begin(); it != lru_list_.end(); ++it) {
                     auto& node = *it->node;
-                    if (node.pin_count == 0 && node.dirty) {
-                        // Flush synchronously while we hold the lock — simpler than queueing here.
-                        std::vector<std::byte> payload(bytes_per_block_);
-                        std::memcpy(payload.data(), node.buffer, bytes_per_block_);
-                        // Drop the lock during the SSD write.
-                        mutex_.unlock();
-                        auto r = store_->write_block(node.block_id, payload);
-                        mutex_.lock();
-                        if (!r) return std::unexpected{r.error()};
+                    if (node.pin_count != 0) continue;
+                    if (!node.dirty && !node.moments_dirty) continue;
+
+                    // Snapshot whichever region(s) are dirty before dropping the lock.
+                    std::vector<std::byte> data_payload;
+                    std::vector<std::byte> moments_payload;
+                    if (node.dirty) {
+                        data_payload.resize(bytes_per_block_);
+                        std::memcpy(data_payload.data(), node.buffer, bytes_per_block_);
+                    }
+                    if (node.moments_dirty && moments_bytes_per_block_ > 0) {
+                        moments_payload.resize(moments_bytes_per_block_);
+                        std::memcpy(moments_payload.data(),
+                                    node.buffer + bytes_per_block_,
+                                    moments_bytes_per_block_);
+                    }
+                    const std::size_t flush_id = node.block_id;
+                    const bool was_data_dirty = node.dirty;
+                    const bool was_moments_dirty = node.moments_dirty;
+
+                    // Drop the lock during the SSD writes.
+                    mutex_.unlock();
+                    if (was_data_dirty) {
+                        auto r = store_->write_block(flush_id, data_payload);
+                        if (!r) {
+                            mutex_.lock();
+                            return std::unexpected{r.error()};
+                        }
+                    }
+                    if (was_moments_dirty) {
+                        auto r = store_->write_moments(flush_id, moments_payload);
+                        if (!r) {
+                            mutex_.lock();
+                            return std::unexpected{r.error()};
+                        }
+                    }
+                    mutex_.lock();
+
+                    if (was_data_dirty) {
                         node.dirty = false;
                         stats_->dirty_blocks_resident.fetch_sub(1, std::memory_order_relaxed);
                         stats_->sync_flushes.fetch_add(1, std::memory_order_relaxed);
-                        flushed_any = true;
-                        break;
                     }
+                    if (was_moments_dirty) {
+                        node.moments_dirty = false;
+                        stats_->sync_flushes.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    flushed_any = true;
+                    break;
                 }
                 if (!flushed_any) {
                     return std::unexpected{"TieredCache: cache full and all blocks pinned (deadlock)"};
@@ -304,6 +432,7 @@ namespace lfs::core {
         node->buffer = buf;
         node->pin_count = 0;
         node->dirty = false;
+        node->moments_dirty = false;
 
         lru_list_.push_back(ListEntry{std::move(node)});
         auto list_it = std::prev(lru_list_.end());
@@ -319,7 +448,7 @@ namespace lfs::core {
     void TieredCache::evict_one_clean_() {
         for (auto it = lru_list_.begin(); it != lru_list_.end(); ++it) {
             auto& node = *it->node;
-            if (node.pin_count == 0 && !node.dirty) {
+            if (node.pin_count == 0 && !node.dirty && !node.moments_dirty) {
                 release_buffer_(node.buffer);
                 map_.erase(node.block_id);
                 lru_list_.erase(it);
@@ -352,9 +481,25 @@ namespace lfs::core {
                 job = std::move(flush_queue_.front());
                 flush_queue_.pop_front();
             }
-            if (auto r = store_->write_block(job.block_id, job.payload); !r) {
-                LOG_ERROR("TieredCache: async flush of block {} failed: {}", job.block_id, r.error());
-            } else {
+            const bool ok = [&] {
+                if (job.is_moments) {
+                    auto r = store_->write_moments(job.block_id, job.payload);
+                    if (!r) {
+                        LOG_ERROR("TieredCache: async flush of block {} (moments) failed: {}",
+                                  job.block_id, r.error());
+                        return false;
+                    }
+                } else {
+                    auto r = store_->write_block(job.block_id, job.payload);
+                    if (!r) {
+                        LOG_ERROR("TieredCache: async flush of block {} (data) failed: {}",
+                                  job.block_id, r.error());
+                        return false;
+                    }
+                }
+                return true;
+            }();
+            if (ok) {
                 stats_->async_flush_jobs.fetch_add(1, std::memory_order_relaxed);
             }
         }

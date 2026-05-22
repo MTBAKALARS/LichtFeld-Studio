@@ -270,3 +270,189 @@ TEST(WorkingSetTest, ExceedingCapacityIsRejected) {
     EXPECT_NE(r.error().find("capacity"), std::string::npos)
         << "error message was: " << r.error();
 }
+
+// ============================================================================
+// Phase 3.5.3b: WorkingSet combined data+moments slot
+// ============================================================================
+
+namespace {
+    // Like WSFixture but builds the store with `Config::with_moments=true` and
+    // wires moments_bytes_per_block through cache + WorkingSet so each slot is
+    // sized for [data : bytes_per_block][moments : moments_bytes_per_block].
+    struct WSMomentsFixture {
+        TempDir tmp;
+        std::shared_ptr<BlockStore> store;
+        std::unique_ptr<TieredCache> cache;
+        std::unique_ptr<WorkingSet> ws;
+
+        WSMomentsFixture(std::size_t num_blocks, std::size_t capacity) {
+            auto data = make_blocks(num_blocks);
+            BlockStore::Config bcfg;
+            bcfg.with_moments = true;
+            auto r = BlockStore::stream_ply_to_base(tmp.path() / "store",
+                                                   as_source(data), bcfg);
+            if (!r.has_value()) {
+                ADD_FAILURE() << "stream_ply_to_base: " << r.error();
+                return;
+            }
+            store = share(std::move(r.value()));
+            if (!store->has_moments()) {
+                ADD_FAILURE() << "fixture: store missing moments region";
+                return;
+            }
+
+            TieredCache::Config ccfg;
+            ccfg.capacity_blocks = std::max<std::size_t>(capacity * 2, 4);
+            cache = std::make_unique<TieredCache>(store, ccfg);
+
+            WorkingSet::Config wcfg;
+            wcfg.capacity_blocks = capacity;
+            wcfg.bytes_per_block = store->bytes_per_block();
+            wcfg.moments_bytes_per_block = store->moments_bytes_per_block();
+            wcfg.cuda_device = 0;
+            auto wr = WorkingSet::create(wcfg);
+            if (!wr.has_value()) {
+                ADD_FAILURE() << "WorkingSet::create: " << wr.error();
+                return;
+            }
+            ws = std::move(wr.value());
+        }
+    };
+} // namespace
+
+TEST(WorkingSetMomentsTest, SlotSizeMatchesDataPlusMoments) {
+    if (!cuda_available()) GTEST_SKIP() << "CUDA device not available";
+    WSMomentsFixture f(/*num_blocks=*/4, /*capacity=*/2);
+    ASSERT_TRUE(f.ws);
+
+    EXPECT_GT(f.ws->moments_bytes_per_block(), 0u);
+    EXPECT_EQ(f.ws->slot_bytes(),
+              f.store->bytes_per_block() + f.store->moments_bytes_per_block());
+}
+
+TEST(WorkingSetMomentsTest, WithoutMomentsBackCompat) {
+    // Legacy v1 path: store has no moments, WS Config leaves the field at 0,
+    // slot stride is just bytes_per_block — full back-compat with v24-class stores.
+    if (!cuda_available()) GTEST_SKIP() << "CUDA device not available";
+    WSFixture f(/*num_blocks=*/4, /*capacity=*/2);
+    ASSERT_TRUE(f.ws);
+
+    EXPECT_FALSE(f.store->has_moments());
+    EXPECT_EQ(f.ws->moments_bytes_per_block(), 0u);
+    EXPECT_EQ(f.ws->slot_bytes(), f.store->bytes_per_block());
+    EXPECT_EQ(f.ws->moments_device_buffer(0), nullptr);
+}
+
+TEST(WorkingSetMomentsTest, LoadV2BlockProvidesMomentsPointer) {
+    if (!cuda_available()) GTEST_SKIP() << "CUDA device not available";
+    WSMomentsFixture f(/*num_blocks=*/4, /*capacity=*/2);
+    ASSERT_TRUE(f.ws);
+
+    const std::array<std::size_t, 2> frame = {0, 1};
+    ASSERT_TRUE(f.ws->load_and_activate(*f.cache, frame).has_value());
+
+    // Both slots have valid moments pointers carved out of the per-slot stride.
+    auto* m0 = f.ws->moments_device_buffer(0);
+    auto* m1 = f.ws->moments_device_buffer(1);
+    EXPECT_NE(m0, nullptr);
+    EXPECT_NE(m1, nullptr);
+    EXPECT_NE(reinterpret_cast<void*>(m0), reinterpret_cast<void*>(m1));
+
+    // Out-of-range slot returns nullptr.
+    EXPECT_EQ(f.ws->moments_device_buffer(999), nullptr);
+}
+
+TEST(WorkingSetMomentsTest, D2DRetainCopiesFullSlot) {
+    // After a retain we expect bytes_d2d_copied >= slot_bytes per retained block
+    // (i.e. larger than data-only would be).
+    if (!cuda_available()) GTEST_SKIP() << "CUDA device not available";
+    WSMomentsFixture f(/*num_blocks=*/8, /*capacity=*/4);
+    ASSERT_TRUE(f.ws);
+
+    const std::array<std::size_t, 4> frame0 = {0, 1, 2, 3};
+    ASSERT_TRUE(f.ws->load_and_activate(*f.cache, frame0).has_value());
+    const auto s0 = f.ws->stats();
+
+    const std::array<std::size_t, 4> frame1 = {2, 3, 4, 5}; // 2 retains, 2 uploads
+    ASSERT_TRUE(f.ws->load_and_activate(*f.cache, frame1).has_value());
+    const auto s1 = f.ws->stats();
+
+    EXPECT_EQ(s1.blocks_retained, s0.blocks_retained + 2u);
+    const std::size_t expect_d2d = 2u * f.ws->slot_bytes();
+    EXPECT_GE(s1.bytes_d2d_copied - s0.bytes_d2d_copied, expect_d2d)
+        << "D2D retain must copy the full slot (data + moments), got "
+        << (s1.bytes_d2d_copied - s0.bytes_d2d_copied)
+        << " bytes for 2 retains; expected >= " << expect_d2d;
+}
+
+TEST(WorkingSetMomentsTest, EvictDirtyWritesBackBothRegions) {
+    // The Phase 3.5.3 round-trip:
+    //   load A → mark moments dirty → load B (forces eviction of A; D2H writeback
+    //   into cache slot's moments region) → load A again (forces re-read from
+    //   cache, which now holds the mutated moments). Verify what comes back.
+    if (!cuda_available()) GTEST_SKIP() << "CUDA device not available";
+    WSMomentsFixture f(/*num_blocks=*/4, /*capacity=*/2);
+    ASSERT_TRUE(f.ws);
+
+    const std::size_t mbpb = f.ws->moments_bytes_per_block();
+    ASSERT_GT(mbpb, 0u);
+    const std::size_t fcount = mbpb / sizeof(float);
+
+    // ---- Frame 0: residents = {0, 1} ----
+    const std::array<std::size_t, 2> frame0 = {0, 1};
+    ASSERT_TRUE(f.ws->load_and_activate(*f.cache, frame0).has_value());
+
+    // Mutate slot-0's moments via the device pointer with a known pattern.
+    {
+        auto slices = f.ws->active_slices();
+        ASSERT_EQ(slices.size(), 2u);
+        ASSERT_EQ(slices[0].block_id, 0u);
+        const std::size_t local0 = slices[0].local_index;
+        float* mptr = f.ws->moments_device_buffer(local0);
+        ASSERT_NE(mptr, nullptr);
+
+        std::vector<float> pattern(fcount);
+        for (std::size_t i = 0; i < fcount; ++i)
+            pattern[i] = static_cast<float>(i % 257) - 128.0f;
+
+        ASSERT_EQ(cudaMemcpy(mptr, pattern.data(), mbpb, cudaMemcpyHostToDevice),
+                  cudaSuccess);
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+        f.ws->mark_dirty(local0, /*data_dirty=*/false, /*moments_dirty=*/true);
+    }
+
+    // ---- Frame 1: residents = {2, 3} — evicts block 0 with dirty moments ----
+    const std::array<std::size_t, 2> frame1 = {2, 3};
+    ASSERT_TRUE(f.ws->load_and_activate(*f.cache, frame1).has_value());
+
+    const auto s1 = f.ws->stats();
+    EXPECT_GE(s1.bytes_written_back, mbpb)
+        << "expected >= one moments-region writeback worth of bytes";
+
+    // ---- Frame 2: residents = {0, 1} — re-read block 0 from cache ----
+    const std::array<std::size_t, 2> frame2 = {0, 1};
+    ASSERT_TRUE(f.ws->load_and_activate(*f.cache, frame2).has_value());
+
+    // Pull back the moments region and verify the pattern survived the
+    // WS→cache→WS round-trip.
+    {
+        auto slices = f.ws->active_slices();
+        ASSERT_EQ(slices.size(), 2u);
+        ASSERT_EQ(slices[0].block_id, 0u);
+        const std::size_t local0 = slices[0].local_index;
+        const float* mptr = f.ws->moments_device_buffer(local0);
+        ASSERT_NE(mptr, nullptr);
+
+        std::vector<float> back(fcount, 0.0f);
+        ASSERT_EQ(cudaMemcpy(back.data(), mptr, mbpb, cudaMemcpyDeviceToHost),
+                  cudaSuccess);
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+        for (std::size_t i = 0; i < fcount; ++i) {
+            const float expect = static_cast<float>(i % 257) - 128.0f;
+            ASSERT_EQ(back[i], expect)
+                << "moments[" << i << "] mismatch after round-trip";
+        }
+    }
+}

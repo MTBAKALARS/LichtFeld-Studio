@@ -89,9 +89,41 @@ namespace lfs::core {
         /**
          * @brief Release a pin previously acquired via @ref get or @ref pin_for_write.
          *
-         * @param dirty If true, the block is marked dirty regardless of how it was acquired.
+         * @param dirty If true, the block's data region is marked dirty regardless
+         *              of how it was acquired. The moments region's dirty bit is
+         *              left alone (it tracks @ref pin_moments_for_write separately).
          */
         void unpin(std::size_t block_id, bool dirty);
+
+        // === Adam moments (optional, present only if backing store has moments) ===
+
+        /// True if the backing @ref BlockStore has an Adam moments sidecar region.
+        bool has_moments() const noexcept { return moments_bytes_per_block_ != 0; }
+
+        /// Per-block byte stride of the moments region (0 if absent).
+        std::size_t moments_bytes_per_block() const noexcept { return moments_bytes_per_block_; }
+
+        /**
+         * @brief Read-only view of a block's Adam moments region.
+         *
+         * Caller MUST already hold a pin on @p block_id via @ref get or
+         * @ref pin_for_write — this call does NOT take an additional pin.
+         * The returned span lives in the same cache slot as the data view and is
+         * valid until that pin is released.
+         *
+         * Errors if the cache has no moments region or the block is not pinned.
+         */
+        std::expected<std::span<const std::byte>, std::string> get_moments(std::size_t block_id);
+
+        /**
+         * @brief Writable view of a block's Adam moments. Marks the moments region
+         *        dirty; subsequent @ref flush_dirty (or eviction with dirty moments)
+         *        persists it via @ref BlockStore::write_moments.
+         *
+         * Caller MUST already hold a pin on @p block_id; this call does NOT take
+         * an additional pin.
+         */
+        std::expected<std::span<std::byte>, std::string> pin_moments_for_write(std::size_t block_id);
 
         // === Eviction ===
 
@@ -117,9 +149,12 @@ namespace lfs::core {
     private:
         struct Node {
             std::size_t block_id = 0;
-            std::byte* buffer = nullptr;   ///< Points into pinned pool
+            std::byte* buffer = nullptr;   ///< Points to start of slot in pinned pool
+                                           ///< Layout: [data : bytes_per_block_] [moments : moments_bytes_per_block_]
             std::uint32_t pin_count = 0;
-            bool dirty = false;
+            bool dirty = false;            ///< Data region dirty
+            bool moments_dirty = false;    ///< Moments region dirty (separate so we
+                                           ///< don't write data when only moments changed)
             // Iterator into lru_list_ for O(1) splice on access. Only valid while pinned == 0.
             // We could use std::list<Node>::iterator but circular type forces erased storage.
         };
@@ -132,7 +167,9 @@ namespace lfs::core {
 
         std::shared_ptr<BlockStore> store_;
         Config config_{};
-        std::size_t bytes_per_block_ = 0;
+        std::size_t bytes_per_block_ = 0;          ///< Data stride (BlockStore::bytes_per_block())
+        std::size_t moments_bytes_per_block_ = 0;  ///< Moments stride (0 if store has no moments)
+        std::size_t slot_bytes_ = 0;               ///< = bytes_per_block_ + moments_bytes_per_block_
 
         // Pinned host memory pool. Allocated once; freed on destruction.
         std::byte* pinned_pool_ = nullptr;
@@ -144,10 +181,12 @@ namespace lfs::core {
         LruList lru_list_;
         std::unordered_map<std::size_t, LruList::iterator> map_;
 
-        // Async flush worker: producer/consumer queue of (block_id, buffer-snapshot).
+        // Async flush worker: producer/consumer queue.
+        // is_moments=true distinguishes a write_moments() job from a write_block().
         struct FlushJob {
             std::size_t block_id;
             std::vector<std::byte> payload; // Owned copy so the cache buffer can be reused immediately
+            bool is_moments = false;
         };
         std::mutex flush_mutex_;
         std::condition_variable flush_cv_;
