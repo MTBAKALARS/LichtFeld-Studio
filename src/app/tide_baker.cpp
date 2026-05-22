@@ -12,7 +12,9 @@
 #include <chrono>
 #include <cstddef>
 #include <filesystem>
+#include <format>
 #include <print>
+#include <string>
 #include <vector>
 
 namespace lfs::app {
@@ -146,10 +148,13 @@ namespace lfs::app {
         if (mode.block_size != 0) {
             cfg.block_size = mode.block_size;
         }
+        // Phase 3.5.3d: opt-in Adam moments sidecar (manifest v2). Tide
+        // out-of-core training with per-block resident Adam requires this.
+        cfg.with_moments = mode.with_moments;
 
         // 6) Stream into BlockStore.
-        LOG_INFO("tide-bake: streaming {} Gaussians into BlockStore at {} (block_size={})",
-                 n_gaussians, lfs::core::path_to_utf8(out_dir), cfg.block_size);
+        LOG_INFO("tide-bake: streaming {} Gaussians into BlockStore at {} (block_size={}, with_moments={})",
+                 n_gaussians, lfs::core::path_to_utf8(out_dir), cfg.block_size, cfg.with_moments);
         const auto t_bake_start = std::chrono::steady_clock::now();
         auto store_res = lfs::core::BlockStore::stream_ply_to_base(out_dir, src, cfg);
         if (!store_res) {
@@ -161,10 +166,13 @@ namespace lfs::app {
                                    .count();
 
         const auto& store = *store_res.value();
-        LOG_INFO("tide-bake: done. blocks={} bytes_per_block={} sh_rest_components={} ({} ms)",
-                 store.num_blocks(), store.bytes_per_block(), sh_rest_components, t_bake_ms);
-        std::println("tide-bake OK: {} blocks @ {} B/block -> {}",
+        LOG_INFO("tide-bake: done. blocks={} bytes_per_block={} sh_rest_components={} manifest_v{} moments_bpb={} ({} ms)",
+                 store.num_blocks(), store.bytes_per_block(), sh_rest_components,
+                 store.manifest_version(), store.moments_bytes_per_block(), t_bake_ms);
+        std::println("tide-bake OK: {} blocks @ {} B/block (manifest v{}{}) -> {}",
                      store.num_blocks(), store.bytes_per_block(),
+                     store.manifest_version(),
+                     store.has_moments() ? std::format(", moments {} B/block", store.moments_bytes_per_block()) : std::string{},
                      lfs::core::path_to_utf8(out_dir));
         return 0;
     }

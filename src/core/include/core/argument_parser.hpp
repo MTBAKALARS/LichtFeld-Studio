@@ -33,6 +33,11 @@ namespace lfs::core::args {
         std::filesystem::path out_dir;
         std::size_t block_size = 0;  ///< 0 = BlockStore::kDefaultBlockSize
         bool overwrite = false;
+        /// Phase 3.5.3d. When true, the baker writes a manifest-v2 store with
+        /// a zero-initialized `moments.bin` sidecar sized for per-block Adam
+        /// state (m + v, 472 B per Gaussian). Required for Tide out-of-core
+        /// training with per-block resident Adam (Phase 3.5.3e+).
+        bool with_moments = false;
     };
     struct PluginMode {
         enum class Command { CREATE,

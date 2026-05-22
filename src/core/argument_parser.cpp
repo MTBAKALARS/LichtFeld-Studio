@@ -832,10 +832,16 @@ plus index file. Pass the resulting directory to --tide-store when training.
 Options:
   --block-size N   Override default block size in Gaussians (must be power of 2)
   -y, --overwrite  Overwrite existing files in <output_dir> without prompting
+  --with-moments   Allocate a per-block Adam moments sidecar (manifest v2).
+                   Required for Tide out-of-core training with per-block
+                   resident Adam. Adds 472 B per Gaussian on disk (~2x the
+                   data footprint), zero-initialized at bake time.
 )");
                     return HelpMode{};
                 } else if (a == "--overwrite" || a == "-y") {
                     mode.overwrite = true;
+                } else if (a == "--with-moments") {
+                    mode.with_moments = true;
                 } else if (a.starts_with("--block-size=")) {
                     try {
                         mode.block_size = std::stoul(std::string(a.substr(std::string_view("--block-size=").size())));
