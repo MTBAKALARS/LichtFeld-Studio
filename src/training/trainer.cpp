@@ -1191,12 +1191,16 @@ namespace lfs::training {
                          tide_runtime_->effective_capacity_blocks);
             }
 
-            auto& splat = strategy_->get_model();
-
-            int max_cap = params.optimization.max_cap;
-            if (!tide_active && max_cap < splat.size()) {
-                LOG_WARN("Max cap is less than to {} initial splats {}. Choosing randomly {} splats", max_cap, splat.size(), max_cap);
-                lfs::core::random_choose(splat, max_cap);
+            // For non-Tide strategies, enforce max_cap on the initial splat.
+            // TideStrategy populates its model inside initialize(); skip here
+            // because get_model() would throw before initialize.
+            if (!tide_active) {
+                auto& splat = strategy_->get_model();
+                int max_cap = params.optimization.max_cap;
+                if (max_cap < splat.size()) {
+                    LOG_WARN("Max cap is less than to {} initial splats {}. Choosing randomly {} splats", max_cap, splat.size(), max_cap);
+                    lfs::core::random_choose(splat, max_cap);
+                }
             }
 
             // Re-initialize strategy with new parameters
