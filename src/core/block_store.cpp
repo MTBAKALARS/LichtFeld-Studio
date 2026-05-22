@@ -6,9 +6,11 @@
 
 #include "core/logger.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <mutex>
 #include <vector>
@@ -33,20 +35,40 @@ namespace lfs::core {
         constexpr const char* kBoundsFile = "bounds.bin";
         constexpr const char* kIndexFile = "index.bin";
         constexpr const char* kManifestFile = "manifest.bin";
+        /// Phase 3.5.3a: optional sidecar storing per-block Adam moments
+        /// (m, v) for the resident-Adam optimizer. Only present when the store
+        /// was created with @ref BlockStore::Config::with_moments == true.
+        constexpr const char* kMomentsFile = "moments.bin";
 
         // Magic + version for the manifest header (forward compatibility).
         constexpr std::uint32_t kManifestMagic = 0x4C544253u; // 'LTBS' (LichtFeld-Tide Block Store)
-        constexpr std::uint32_t kManifestVersion = 1;
+        /// Manifest schema versions.
+        ///   v1 (40 B): magic | version | num_blocks | block_size | bytes_per_block | patch_capacity
+        ///   v2 (56 B): v1 fields + moments_bytes_per_block + flags + reserved
+        /// New stores are always written as v2. Legacy v1 stores remain readable
+        /// (moments treated as absent). `kManifestVersionCurrent` is what we write;
+        /// `kManifestVersionLegacy` is what we accept on read.
+        constexpr std::uint32_t kManifestVersionLegacy  = 1;
+        constexpr std::uint32_t kManifestVersionCurrent = 2;
 
+        /// On-disk manifest, v2 layout. v1 manifests deserialize by reading only
+        /// the first 40 bytes and leaving v2 fields at zero (meaning "no moments").
         struct Manifest {
             std::uint32_t magic;
             std::uint32_t version;
             std::uint64_t num_blocks;
             std::uint64_t block_size;       // Gaussians per block
-            std::uint64_t bytes_per_block;  // = block_size * 236
+            std::uint64_t bytes_per_block;  // = block_size * 236 (data only, unchanged)
             std::uint64_t patch_segment_capacity_bytes;
+            // v2 fields below. Zero in v1 stores.
+            std::uint64_t moments_bytes_per_block; // 0 if no moments region (or v1)
+            std::uint32_t flags;                   // reserved
+            std::uint32_t reserved;                // reserved
         };
-        static_assert(sizeof(Manifest) == 40, "Manifest layout must be stable");
+        static_assert(sizeof(Manifest) == 56, "ManifestV2 layout must be stable");
+        // Byte offsets used to read v1 manifests safely.
+        constexpr std::size_t kManifestV1Bytes = 40;
+        constexpr std::size_t kManifestV2Bytes = 56;
 
         std::string filesystem_error_to_string(const std::filesystem::filesystem_error& e) {
             return std::string{"filesystem error: "} + e.what();
@@ -78,6 +100,11 @@ namespace lfs::core {
 #if defined(_WIN32)
         HANDLE base_file = INVALID_HANDLE_VALUE;
         HANDLE base_mapping = nullptr;
+        // Optional Adam moments sidecar (Phase 3.5.3a). Opened R/W on stores that
+        // have the moments region. Accessed via pread/pwrite-style positional I/O —
+        // we do NOT mmap moments because they are mutated on every block eviction
+        // and we want explicit, durable writes.
+        HANDLE moments_file = INVALID_HANDLE_VALUE;
         // Patch segments: append-only files, opened for write + memory-mapped read view (per segment).
         struct PatchSegment {
             HANDLE file = INVALID_HANDLE_VALUE;
@@ -88,6 +115,8 @@ namespace lfs::core {
         };
 #else
         int base_fd = -1;
+        // Optional Adam moments sidecar (Phase 3.5.3a). See Win32 branch above.
+        int moments_fd = -1;
         struct PatchSegment {
             int fd = -1;
             const std::byte* view = nullptr;
@@ -104,6 +133,13 @@ namespace lfs::core {
 
         // Patch segment append guard (one writer at a time per active patch).
         std::mutex patch_mutex;
+
+        // Moments file positional I/O guard (one writer at a time per block file).
+        // Reads can race in principle, but Win32 ReadFile w/ OVERLAPPED needs a
+        // serialization point on a single HANDLE — so we use the same mutex for
+        // both directions. Hot path for moments is at evict/admit time, not the
+        // per-iteration training step, so contention is low.
+        std::mutex moments_mutex;
 
         // Append a block payload to the active patch segment, rolling over if needed.
         // Returns the resolved IndexEntry pointing at the new copy.
@@ -206,15 +242,44 @@ namespace lfs::core {
             if (!out) return std::unexpected{"create: write index.bin failed"};
         }
 
+        // Phase 3.5.3a: optionally allocate the Adam moments sidecar. We
+        // zero-fill the entire region up front so the file is contiguous on
+        // disk (better sequential I/O during evict/admit) and so the first
+        // training step can read deterministic zeros for any block.
+        const std::size_t moments_bytes_per_block =
+            config.with_moments ? (config.block_size * kAdamMomentsBytesPerGaussian) : 0;
+        if (config.with_moments) {
+            const std::uint64_t total = static_cast<std::uint64_t>(num_blocks) * moments_bytes_per_block;
+            std::ofstream out(dir / kMomentsFile, std::ios::binary);
+            if (!out) return std::unexpected{"create: failed to open moments.bin for write"};
+            // Write in 4 MiB chunks to keep the temporary buffer small even for
+            // multi-GiB moments regions.
+            constexpr std::size_t kChunk = 4ull << 20;
+            std::vector<char> zeros(std::min<std::size_t>(kChunk, total), 0);
+            std::uint64_t remaining = total;
+            while (remaining > 0) {
+                const std::size_t n = static_cast<std::size_t>(std::min<std::uint64_t>(remaining, kChunk));
+                out.write(zeros.data(), static_cast<std::streamsize>(n));
+                if (!out) return std::unexpected{"create: zero-fill moments.bin failed"};
+                remaining -= n;
+            }
+        }
+
         // Write manifest last — its presence signals a fully-initialized store.
+        // We always write the v2 layout; v2-aware readers see moments_bytes_per_block
+        // and act accordingly. v1-only readers would reject magic/version mismatch
+        // (no such reader exists in-tree).
         {
             Manifest m{
                 .magic = kManifestMagic,
-                .version = kManifestVersion,
+                .version = kManifestVersionCurrent,
                 .num_blocks = num_blocks,
                 .block_size = config.block_size,
                 .bytes_per_block = bytes_per_block,
                 .patch_segment_capacity_bytes = config.patch_segment_capacity_bytes,
+                .moments_bytes_per_block = moments_bytes_per_block,
+                .flags = 0,
+                .reserved = 0,
             };
             std::ofstream out(dir / kManifestFile, std::ios::binary);
             if (!out) return std::unexpected{"create: failed to open manifest.bin for write"};
@@ -222,9 +287,13 @@ namespace lfs::core {
             if (!out) return std::unexpected{"create: write manifest.bin failed"};
         }
 
-        LOG_INFO("BlockStore: created at {} ({} blocks, {} B/block, {:.2f} GiB)",
+        LOG_INFO("BlockStore: created at {} ({} blocks, {} B/block, {:.2f} GiB data{})",
                  dir.string(), num_blocks, bytes_per_block,
-                 static_cast<double>(expected_bytes) / (1ull << 30));
+                 static_cast<double>(expected_bytes) / (1ull << 30),
+                 config.with_moments
+                     ? std::format(", + {:.2f} GiB Adam moments",
+                                   static_cast<double>(num_blocks * moments_bytes_per_block) / (1ull << 30))
+                     : std::string{});
 
         return open(dir, config);
     }
@@ -239,16 +308,45 @@ namespace lfs::core {
         }
 
         // Read manifest first — it determines block_size, num_blocks, etc.
+        // Dual-version path: detect schema by inspecting `version` after reading
+        // the v1-sized header, then optionally read the v2 tail. This keeps
+        // legacy stores (e.g. vatican_v24) openable without re-baking.
         Manifest m{};
+        std::uint32_t manifest_version_read = 0;
         {
             std::ifstream in(manifest_path, std::ios::binary);
             if (!in) return std::unexpected{"open: failed to open manifest.bin"};
-            in.read(reinterpret_cast<char*>(&m), sizeof(m));
+
+            // Read the legacy-sized prefix first.
+            in.read(reinterpret_cast<char*>(&m), kManifestV1Bytes);
             if (!in || m.magic != kManifestMagic) {
                 return std::unexpected{"open: bad manifest magic"};
             }
-            if (m.version != kManifestVersion) {
-                return std::unexpected{std::format("open: unsupported manifest version {}", m.version)};
+            manifest_version_read = m.version;
+            if (manifest_version_read == kManifestVersionLegacy) {
+                // v1: leave the v2 tail at zero (means "no moments").
+                m.moments_bytes_per_block = 0;
+                m.flags = 0;
+                m.reserved = 0;
+            } else if (manifest_version_read == kManifestVersionCurrent) {
+                // v2: read the remaining bytes.
+                static_assert(kManifestV2Bytes - kManifestV1Bytes == sizeof(Manifest::moments_bytes_per_block) +
+                                                                          sizeof(Manifest::flags) +
+                                                                          sizeof(Manifest::reserved),
+                              "v2 tail size mismatch");
+                in.read(reinterpret_cast<char*>(&m) + kManifestV1Bytes,
+                        kManifestV2Bytes - kManifestV1Bytes);
+                if (!in) return std::unexpected{"open: short read on manifest v2 tail"};
+            } else {
+                return std::unexpected{std::format("open: unsupported manifest version {}", manifest_version_read)};
+            }
+
+            // Sanity check: if moments_bytes_per_block is set, it must match block_size * 472.
+            if (m.moments_bytes_per_block != 0 &&
+                m.moments_bytes_per_block != m.block_size * kAdamMomentsBytesPerGaussian) {
+                return std::unexpected{std::format(
+                    "open: moments_bytes_per_block={} does not match block_size({})*{}",
+                    m.moments_bytes_per_block, m.block_size, kAdamMomentsBytesPerGaussian)};
             }
         }
 
@@ -261,6 +359,8 @@ namespace lfs::core {
         store->stats_ = std::make_unique<Stats>();
         store->impl_ = std::make_unique<Impl>();
         store->impl_->dir = dir;
+        store->moments_bytes_per_block_ = static_cast<std::size_t>(m.moments_bytes_per_block);
+        store->manifest_version_ = manifest_version_read;
 
         // Load bounds
         store->bounds_.resize(m.num_blocks);
@@ -297,8 +397,50 @@ namespace lfs::core {
             store->stats_->patch_segments.fetch_add(1, std::memory_order_relaxed);
         }
 
-        LOG_INFO("BlockStore: opened {} ({} blocks, {} patch segments)",
-                 dir.string(), m.num_blocks, store->impl_->patch_segments.size());
+        // Phase 3.5.3a: open the optional moments sidecar if the manifest says
+        // it is present. We require the file to exist and match the expected
+        // size; mismatch indicates a corrupted or partial bake.
+        if (store->moments_bytes_per_block_ != 0) {
+            const auto moments_path = dir / kMomentsFile;
+            if (!std::filesystem::exists(moments_path)) {
+                return std::unexpected{std::format(
+                    "open: manifest declares moments region but {} is missing",
+                    moments_path.string())};
+            }
+            const std::uint64_t expected_moments_size =
+                static_cast<std::uint64_t>(store->num_blocks_) * store->moments_bytes_per_block_;
+            std::error_code ec;
+            const auto actual = std::filesystem::file_size(moments_path, ec);
+            if (ec) {
+                return std::unexpected{std::format("open: stat moments.bin failed: {}", ec.message())};
+            }
+            if (actual != expected_moments_size) {
+                return std::unexpected{std::format(
+                    "open: moments.bin size {} != expected {} ({} blocks * {} B)",
+                    actual, expected_moments_size, store->num_blocks_, store->moments_bytes_per_block_)};
+            }
+#if defined(_WIN32)
+            store->impl_->moments_file = CreateFileW(moments_path.wstring().c_str(),
+                                                    GENERIC_READ | GENERIC_WRITE,
+                                                    FILE_SHARE_READ, nullptr,
+                                                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (store->impl_->moments_file == INVALID_HANDLE_VALUE) {
+                return std::unexpected{last_win32_error("CreateFile(moments)")};
+            }
+#else
+            store->impl_->moments_fd = ::open(moments_path.c_str(), O_RDWR);
+            if (store->impl_->moments_fd < 0) {
+                return std::unexpected{std::string{"open(moments) failed: "} + std::strerror(errno)};
+            }
+#endif
+        }
+
+        LOG_INFO("BlockStore: opened {} ({} blocks, {} patch segments, manifest v{}{})",
+                 dir.string(), m.num_blocks, store->impl_->patch_segments.size(),
+                 manifest_version_read,
+                 store->has_moments()
+                     ? std::format(", moments {} B/block", store->moments_bytes_per_block_)
+                     : std::string{});
 
         return store;
     }
@@ -398,6 +540,92 @@ namespace lfs::core {
         }
         std::scoped_lock lk(impl_->index_mutex);
         return impl_->index[block_id];
+    }
+
+    // ============================================================
+    // Adam moments sidecar (Phase 3.5.3a)
+    // ============================================================
+
+    std::expected<void, std::string>
+    BlockStore::read_moments(std::size_t block_id, std::span<std::byte> dst) const {
+        if (!impl_) return std::unexpected{"read_moments: store closed"};
+        if (moments_bytes_per_block_ == 0) {
+            return std::unexpected{"read_moments: store has no moments region"};
+        }
+        if (block_id >= num_blocks_) {
+            return std::unexpected{std::format("read_moments: block_id={} >= num_blocks={}",
+                                               block_id, num_blocks_)};
+        }
+        if (dst.size() != moments_bytes_per_block_) {
+            return std::unexpected{std::format("read_moments: dst.size()={} != moments_bytes_per_block={}",
+                                               dst.size(), moments_bytes_per_block_)};
+        }
+        const std::uint64_t offset =
+            static_cast<std::uint64_t>(block_id) * moments_bytes_per_block_;
+        std::scoped_lock lk(impl_->moments_mutex);
+#if defined(_WIN32)
+        OVERLAPPED ov{};
+        ov.Offset     = static_cast<DWORD>(offset & 0xFFFFFFFFu);
+        ov.OffsetHigh = static_cast<DWORD>((offset >> 32) & 0xFFFFFFFFu);
+        DWORD read = 0;
+        if (!ReadFile(impl_->moments_file, dst.data(),
+                      static_cast<DWORD>(dst.size()), &read, &ov)) {
+            return std::unexpected{last_win32_error("ReadFile(moments)")};
+        }
+        if (read != dst.size()) {
+            return std::unexpected{"read_moments: short read"};
+        }
+#else
+        const ssize_t n = ::pread(impl_->moments_fd, dst.data(), dst.size(), static_cast<off_t>(offset));
+        if (n < 0) return std::unexpected{std::string{"pread(moments) failed: "} + std::strerror(errno)};
+        if (static_cast<std::size_t>(n) != dst.size()) {
+            return std::unexpected{"read_moments: short read"};
+        }
+#endif
+        stats_->reads.fetch_add(1, std::memory_order_relaxed);
+        stats_->bytes_read.fetch_add(dst.size(), std::memory_order_relaxed);
+        return {};
+    }
+
+    std::expected<void, std::string>
+    BlockStore::write_moments(std::size_t block_id, std::span<const std::byte> src) {
+        if (!impl_) return std::unexpected{"write_moments: store closed"};
+        if (moments_bytes_per_block_ == 0) {
+            return std::unexpected{"write_moments: store has no moments region"};
+        }
+        if (block_id >= num_blocks_) {
+            return std::unexpected{std::format("write_moments: block_id={} >= num_blocks={}",
+                                               block_id, num_blocks_)};
+        }
+        if (src.size() != moments_bytes_per_block_) {
+            return std::unexpected{std::format("write_moments: src.size()={} != moments_bytes_per_block={}",
+                                               src.size(), moments_bytes_per_block_)};
+        }
+        const std::uint64_t offset =
+            static_cast<std::uint64_t>(block_id) * moments_bytes_per_block_;
+        std::scoped_lock lk(impl_->moments_mutex);
+#if defined(_WIN32)
+        OVERLAPPED ov{};
+        ov.Offset     = static_cast<DWORD>(offset & 0xFFFFFFFFu);
+        ov.OffsetHigh = static_cast<DWORD>((offset >> 32) & 0xFFFFFFFFu);
+        DWORD written = 0;
+        if (!WriteFile(impl_->moments_file, src.data(),
+                       static_cast<DWORD>(src.size()), &written, &ov)) {
+            return std::unexpected{last_win32_error("WriteFile(moments)")};
+        }
+        if (written != src.size()) {
+            return std::unexpected{"write_moments: short write"};
+        }
+#else
+        const ssize_t n = ::pwrite(impl_->moments_fd, src.data(), src.size(), static_cast<off_t>(offset));
+        if (n < 0) return std::unexpected{std::string{"pwrite(moments) failed: "} + std::strerror(errno)};
+        if (static_cast<std::size_t>(n) != src.size()) {
+            return std::unexpected{"write_moments: short write"};
+        }
+#endif
+        stats_->writes.fetch_add(1, std::memory_order_relaxed);
+        stats_->bytes_written.fetch_add(src.size(), std::memory_order_relaxed);
+        return {};
     }
 
     BlockStore::BlockBounds BlockStore::get_bounds(std::size_t block_id) const {
@@ -597,6 +825,10 @@ namespace lfs::core {
             CloseHandle(base_file);
             base_file = INVALID_HANDLE_VALUE;
         }
+        if (moments_file != INVALID_HANDLE_VALUE) {
+            CloseHandle(moments_file);
+            moments_file = INVALID_HANDLE_VALUE;
+        }
 #else
         for (auto& seg : patch_segments) {
             if (seg.view) ::munmap(const_cast<std::byte*>(seg.view), seg.view_size);
@@ -610,6 +842,10 @@ namespace lfs::core {
         if (base_fd >= 0) {
             ::close(base_fd);
             base_fd = -1;
+        }
+        if (moments_fd >= 0) {
+            ::close(moments_fd);
+            moments_fd = -1;
         }
 #endif
         patch_segments.clear();

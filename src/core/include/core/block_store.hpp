@@ -46,6 +46,14 @@ namespace lfs::core {
         // === Constants matching TideGS paper ===
         static constexpr std::size_t kAttributesPerGaussian = 59;          ///< xyz(3)+scale(3)+rot(4)+opacity(1)+dc(3)+rest(45)
         static constexpr std::size_t kBytesPerGaussian = kAttributesPerGaussian * sizeof(float); ///< 236 B
+        /// Per-Gaussian byte footprint of Adam optimizer moments (m + v, fp32).
+        /// Stored in a separate optional region so the immutable base segment
+        /// stays at 236 B/Gaussian (existing v1 stores reusable without re-bake).
+        /// Layout matches @ref kAttributesPerGaussian one-to-one in SOA order, so a
+        /// resident WorkingSet slot can address moments by the same param-offset
+        /// table as parameters. See @ref Phase 3.5.3 design in TideGS paper Sec. 3.4.
+        static constexpr std::size_t kAdamMomentsBytesPerGaussian =
+            2u * kAttributesPerGaussian * sizeof(float); ///< 472 B (m,v fp32 × 59 scalars)
         static constexpr std::size_t kDefaultBlockSize = 4096;             ///< Gaussians per block (TideGS B)
         static constexpr std::size_t kPageSize = 4096;                     ///< OS page size for mmap alignment
 
@@ -79,6 +87,14 @@ namespace lfs::core {
             std::size_t block_size = kDefaultBlockSize;          ///< Gaussians per block
             std::size_t patch_segment_capacity_bytes = 1ull << 30; ///< Roll over patch file every 1 GiB
             bool prefault_base = false;                          ///< MAP_POPULATE-equivalent on open (slow first call)
+            /// When true at @ref create time, allocates a per-block Adam moments
+            /// region of @ref kAdamMomentsBytesPerGaussian × block_size bytes per
+            /// block in a separate `moments.bin` file, zero-initialized. Triggers a
+            /// manifest v2 header. Default false keeps existing stores byte-for-byte
+            /// compatible (manifest stays v1, no moments file written).
+            /// On @ref open this field is ignored; the manifest dictates whether
+            /// moments are present (queryable via @ref has_moments).
+            bool with_moments = false;
         };
 
         BlockStore();
@@ -215,6 +231,27 @@ namespace lfs::core {
         /// Get the current index entry (latest version) for @p block_id.
         std::expected<IndexEntry, std::string> lookup(std::size_t block_id) const;
 
+        // === Adam moments (optional sidecar region) ===
+
+        /// True if this store has a moments region (was created with
+        /// @ref Config::with_moments == true, or opened from a manifest-v2 store
+        /// whose moments_bytes_per_block > 0).
+        bool has_moments() const noexcept { return moments_bytes_per_block_ != 0; }
+
+        /// Per-block byte count of the Adam moments region, or 0 if absent.
+        /// Always either 0 or `block_size * kAdamMomentsBytesPerGaussian`.
+        std::size_t moments_bytes_per_block() const noexcept { return moments_bytes_per_block_; }
+
+        /// Read a block's Adam moments into @p dst.
+        /// @p dst.size() must equal @ref moments_bytes_per_block(). Errors if the
+        /// store has no moments region.
+        std::expected<void, std::string> read_moments(std::size_t block_id, std::span<std::byte> dst) const;
+
+        /// Overwrite a block's Adam moments in place. Unlike @ref write_block, moments
+        /// are not versioned (Adam state is transient training state) — we overwrite
+        /// the per-block slot directly. @p src.size() must equal @ref moments_bytes_per_block().
+        std::expected<void, std::string> write_moments(std::size_t block_id, std::span<const std::byte> src);
+
         /// Get the bounding sphere for a block. Bounds are mutable across writes via @ref update_bounds.
         BlockBounds get_bounds(std::size_t block_id) const;
 
@@ -233,6 +270,9 @@ namespace lfs::core {
         std::size_t block_size() const noexcept { return config_.block_size; }
         std::size_t bytes_per_block() const noexcept { return config_.block_size * kBytesPerGaussian; }
         const std::filesystem::path& directory() const noexcept { return dir_; }
+
+        /// Manifest schema version this store was opened with (1 = legacy, 2 = with optional moments).
+        std::uint32_t manifest_version() const noexcept { return manifest_version_; }
 
         /// Aggregate counters for telemetry parity with TideGS (cache_hits, etc.).
         struct Stats {
@@ -258,6 +298,11 @@ namespace lfs::core {
         // for now (per-block atomics can come later if profiling shows contention).
         mutable std::mutex bounds_mutex_;
         std::vector<BlockBounds> bounds_;
+
+        // Optional Adam moments sidecar region. 0 if absent.
+        std::size_t moments_bytes_per_block_ = 0;
+        // Manifest schema version (1 or 2). Used by tests and diagnostics.
+        std::uint32_t manifest_version_ = 0;
     };
 
 } // namespace lfs::core
