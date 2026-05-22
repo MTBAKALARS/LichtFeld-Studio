@@ -1,17 +1,23 @@
 /* SPDX-FileCopyrightText: 2026 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
+#include "core/block_store.hpp"
 #include "core/camera.hpp"
 #include "core/camera_types.h"
 #include "core/parameters.hpp"
 #include "core/splat_data.hpp"
 #include "strategies/strategy_factory.hpp"
 #include "strategies/tide_strategy.hpp"
+#include "tide/frustum_culler.hpp"
+#include "tide/tide_runtime.hpp"
 
+#include <array>
+#include <cmath>
 #include <cuda_runtime.h>
 #include <filesystem>
 #include <gtest/gtest.h>
 #include <memory>
+#include <random>
 #include <sstream>
 #include <vector>
 
@@ -247,6 +253,11 @@ TEST(TideStrategyTest, PreForwardIsNoOpAfterInitializeWithoutWorkingSet) {
     EXPECT_EQ(strategy.soa_capacity_gaussians(), cap_before);
     EXPECT_EQ(strategy.soa_scratch_bytes(), bytes_before);
     EXPECT_EQ(strategy.get_working_set(), nullptr);
+
+    // Phase 3.5.2: without sources attached, telemetry stays empty/false.
+    EXPECT_EQ(strategy.last_visible_block_count(), 0u);
+    EXPECT_TRUE(strategy.last_visible_block_ids().empty());
+    EXPECT_FALSE(strategy.last_pre_forward_loaded());
 }
 
 TEST(TideStrategyTest, PreForwardDispatchesViaIStrategyBasePointer) {
@@ -262,4 +273,202 @@ TEST(TideStrategyTest, PreForwardDispatchesViaIStrategyBasePointer) {
     // pins the override is wired correctly.
     EXPECT_NO_THROW(base->pre_forward(0, cam));
     EXPECT_NO_THROW(base->pre_forward(42, cam));
+}
+
+
+// ============================================================================
+// Phase 3.5.2 — frustum-driven residency tests.
+// ============================================================================
+
+namespace {
+
+    namespace fs = std::filesystem;
+
+    class TideTempDir {
+    public:
+        TideTempDir() {
+            std::random_device rd;
+            const auto name = "lfs_tide_strategy_test_" + std::to_string(rd()) + "_" + std::to_string(rd());
+            path_ = fs::temp_directory_path() / name;
+            fs::create_directories(path_);
+        }
+        ~TideTempDir() {
+            std::error_code ec;
+            fs::remove_all(path_, ec);
+        }
+        TideTempDir(const TideTempDir&) = delete;
+        TideTempDir& operator=(const TideTempDir&) = delete;
+        const fs::path& path() const { return path_; }
+    private:
+        fs::path path_;
+    };
+
+    // Build a tiny on-disk BlockStore with `num_blocks` blocks where each
+    // block's spatial bounds end up centered along the X-axis. Means are
+    // arranged in a regular 64-per-side cube within each block, scaled so
+    // that consecutive blocks land far apart (block i centered roughly at
+    // x = i * 1000) — this gives frustum culling something meaningful to
+    // distinguish.
+    void make_synthetic_tide_store(const fs::path& dir, std::size_t num_blocks) {
+        constexpr std::size_t kRest = 45;
+        const std::size_t n = BlockStore::kDefaultBlockSize * num_blocks;
+        std::vector<float> means(3 * n, 0.0f);
+        std::vector<float> scaling(3 * n, -2.0f);
+        std::vector<float> rotation(4 * n, 0.0f);
+        std::vector<float> opacity(n, 0.5f);
+        std::vector<float> sh0(3 * n, 0.5f);
+        std::vector<float> shN(kRest * n, 0.0f);
+        for (std::size_t i = 0; i < n; ++i) {
+            // Each block is 4096 Gaussians; spread them across the X axis
+            // so the streaming Morton order puts neighbors in the same block.
+            const std::size_t block_index = i / BlockStore::kDefaultBlockSize;
+            const std::size_t intra = i % BlockStore::kDefaultBlockSize;
+            means[3 * i + 0] = static_cast<float>(block_index) * 1000.0f
+                             + static_cast<float>(intra % 16) * 0.1f;
+            means[3 * i + 1] = static_cast<float>((intra / 16) % 16) * 0.1f;
+            means[3 * i + 2] = static_cast<float>(intra / (16 * 16)) * 0.1f;
+            rotation[4 * i + 0] = 1.0f;
+        }
+        BlockStore::PlySource src;
+        src.means = means;
+        src.scaling = scaling;
+        src.rotation = rotation;
+        src.opacity = opacity;
+        src.sh0 = sh0;
+        src.shN = shN;
+        src.num_gaussians = n;
+        src.sh_rest_components = kRest;
+
+        auto r = BlockStore::stream_ply_to_base(dir, src);
+        ASSERT_TRUE(r.has_value()) << "stream_ply_to_base: " << r.error();
+    }
+
+} // namespace
+
+TEST(TideFrustumPlanesTest, IdentityCameraProducesNormalizedPlanes) {
+    SKIP_IF_NO_CUDA();
+    auto cam = make_test_camera();
+    std::array<lfs::training::tide::FrustumCuller::Plane, 6> planes{};
+    ASSERT_NO_THROW(
+        lfs::training::tide::FrustumCuller::compute_frustum_planes(
+            cam, /*near=*/0.01f, /*far=*/1000.0f, planes));
+
+    for (std::size_t k = 0; k < 6; ++k) {
+        const auto& p = planes[k];
+        const float n2 = p.a * p.a + p.b * p.b + p.c * p.c;
+        EXPECT_NEAR(n2, 1.0f, 1e-4f)
+            << "Plane " << k << " is not unit-normalized: (a,b,c)=("
+            << p.a << "," << p.b << "," << p.c << ")";
+    }
+}
+
+TEST(TideFrustumPlanesTest, RejectsBadNearFar) {
+    SKIP_IF_NO_CUDA();
+    auto cam = make_test_camera();
+    std::array<lfs::training::tide::FrustumCuller::Plane, 6> planes{};
+    EXPECT_THROW(
+        lfs::training::tide::FrustumCuller::compute_frustum_planes(cam, 0.0f, 1.0f, planes),
+        std::runtime_error);
+    EXPECT_THROW(
+        lfs::training::tide::FrustumCuller::compute_frustum_planes(cam, 1.0f, 1.0f, planes),
+        std::runtime_error);
+    EXPECT_THROW(
+        lfs::training::tide::FrustumCuller::compute_frustum_planes(cam, 10.0f, 1.0f, planes),
+        std::runtime_error);
+}
+
+TEST(TideStrategyPreForwardTest, NoSourcesAttachedRemainsNoOp) {
+    SKIP_IF_NO_CUDA();
+    auto splat = make_test_splat_data();
+    TideStrategy strategy(splat);
+    strategy.initialize(make_opt_params());
+
+    // set_tide_sources with null pointers must NOT enable the real path:
+    // both store and cache need to be non-null.
+    strategy.set_tide_sources(nullptr, nullptr);
+
+    auto cam = make_test_camera();
+    ASSERT_NO_THROW(strategy.pre_forward(0, cam));
+    EXPECT_FALSE(strategy.last_pre_forward_loaded());
+    EXPECT_EQ(strategy.last_visible_block_count(), 0u);
+}
+
+TEST(TideStrategyPreForwardTest, FullResidencyEndToEnd) {
+    SKIP_IF_NO_CUDA();
+    TideTempDir tmp;
+    const fs::path store_dir = tmp.path() / "store";
+    constexpr std::size_t kNumBlocks = 4;
+    make_synthetic_tide_store(store_dir, kNumBlocks);
+
+    // Build a runtime via attach_tide_working_set, which wires both
+    // set_working_set AND set_tide_sources for us.
+    auto placeholder = make_test_splat_data(/*n=*/4, /*sh_degree=*/3);
+    TideStrategy strategy(placeholder);
+    lfs::core::param::OptimizationParameters opt = make_opt_params();
+    opt.tide_store_path = store_dir;
+    opt.tide_capacity_blocks = kNumBlocks;  // full residency
+
+    auto rt_result = lfs::training::tide::attach_tide_working_set(strategy, opt);
+    ASSERT_TRUE(rt_result.has_value()) << rt_result.error();
+    auto runtime = std::move(rt_result.value());
+
+    strategy.initialize(opt);
+    ASSERT_NE(strategy.get_working_set(), nullptr);
+
+    auto cam = make_test_camera();
+
+    // First call: should compute visible_ids AND issue a load_and_activate.
+    ASSERT_NO_THROW(strategy.pre_forward(0, cam));
+    EXPECT_TRUE(strategy.last_pre_forward_loaded())
+        << "First pre_forward must populate the WorkingSet via load_and_activate";
+    EXPECT_GT(strategy.last_visible_block_count(), 0u)
+        << "FrustumCuller should report at least one visible block for an "
+           "identity-rotation camera centered at origin";
+    EXPECT_LE(strategy.last_visible_block_count(), kNumBlocks);
+
+    // Verify the WorkingSet was actually populated.
+    auto* ws = strategy.get_working_set();
+    ASSERT_NE(ws, nullptr);
+    EXPECT_EQ(ws->active_block_count(), kNumBlocks)
+        << "Phase 3.5.2 deliberately forces full residency until per-block "
+           "Adam moments (3.5.3) land";
+
+    // Second call with the same camera: resident set is unchanged, so the
+    // strategy must SKIP the load (perf parity with Phase 3.4c).
+    ASSERT_NO_THROW(strategy.pre_forward(1, cam));
+    EXPECT_FALSE(strategy.last_pre_forward_loaded())
+        << "Idempotent re-load must be skipped when the resident set is unchanged";
+    EXPECT_GT(strategy.last_visible_block_count(), 0u)
+        << "Visible-id telemetry must still be computed even when the load is skipped";
+
+    // WorkingSet is still active.
+    EXPECT_EQ(ws->active_block_count(), kNumBlocks);
+}
+
+TEST(TideStrategyPreForwardTest, VisibleIdsAreSortedAscending) {
+    SKIP_IF_NO_CUDA();
+    TideTempDir tmp;
+    const fs::path store_dir = tmp.path() / "store";
+    constexpr std::size_t kNumBlocks = 4;
+    make_synthetic_tide_store(store_dir, kNumBlocks);
+
+    auto placeholder = make_test_splat_data(/*n=*/4, /*sh_degree=*/3);
+    TideStrategy strategy(placeholder);
+    lfs::core::param::OptimizationParameters opt = make_opt_params();
+    opt.tide_store_path = store_dir;
+    opt.tide_capacity_blocks = kNumBlocks;
+
+    auto rt_result = lfs::training::tide::attach_tide_working_set(strategy, opt);
+    ASSERT_TRUE(rt_result.has_value()) << rt_result.error();
+    auto runtime = std::move(rt_result.value());
+
+    strategy.initialize(opt);
+    auto cam = make_test_camera();
+    strategy.pre_forward(0, cam);
+
+    const auto& ids = strategy.last_visible_block_ids();
+    for (std::size_t i = 1; i < ids.size(); ++i) {
+        EXPECT_LT(ids[i - 1], ids[i])
+            << "FrustumCuller::cull guarantees ascending block_id order";
+    }
 }

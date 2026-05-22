@@ -405,6 +405,11 @@ namespace lfs::core {
         return bounds_[block_id];
     }
 
+    void BlockStore::snapshot_bounds(std::vector<BlockBounds>& out) const {
+        std::scoped_lock lk(bounds_mutex_);
+        out.assign(bounds_.begin(), bounds_.end());
+    }
+
     void BlockStore::update_bounds(std::size_t block_id, const BlockBounds& bounds) {
         std::scoped_lock lk(bounds_mutex_);
         bounds_[block_id] = bounds;

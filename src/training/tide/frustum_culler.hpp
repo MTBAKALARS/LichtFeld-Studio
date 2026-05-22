@@ -6,9 +6,14 @@
 
 #include "core/block_store.hpp"
 
+#include <array>
 #include <cstddef>
 #include <span>
 #include <vector>
+
+namespace lfs::core {
+    class Camera;
+}
 
 namespace lfs::training::tide {
 
@@ -53,6 +58,35 @@ namespace lfs::training::tide {
          */
         static bool visible(const lfs::core::BlockStore::BlockBounds& b,
                             std::span<const Plane, 6> planes) noexcept;
+
+        /**
+         * @brief Compute the 6 world-space frustum planes for @p cam.
+         *
+         * Builds the camera-space planes from the camera's intrinsic FoV and the
+         * (@p near_plane, @p far_plane) Z-clip range, then transforms each plane
+         * into world space using the camera's `world_view_transform()` (a 4×4
+         * world→camera matrix). Output planes are normalized so `a²+b²+c² = 1`,
+         * matching the convention required by @ref visible.
+         *
+         * The COLMAP / 3DGS camera convention is right-handed with the camera
+         * looking down +Z (image plane at z>0). Cost is a single CPU pull of the
+         * 4×4 view matrix (16 floats) plus ~60 FMAs, well under a microsecond.
+         *
+         * The parameter names avoid the Windows legacy macros `near` / `far`
+         * which `<windows.h>` defines to nothing on MSVC.
+         *
+         * @param cam        Camera providing intrinsics and `world_view_transform`.
+         * @param near_plane Near Z-clip in camera space. Use a small positive value
+         *                   (e.g. 0.01 × scene scale).
+         * @param far_plane  Far Z-clip in camera space. Use a large value (e.g.
+         *                   1e6) for "effectively unlimited".
+         * @param out        Receives the 6 world-space planes in fixed order
+         *                   `{left, right, bottom, top, near, far}`.
+         */
+        static void compute_frustum_planes(const lfs::core::Camera& cam,
+                                           float near_plane,
+                                           float far_plane,
+                                           std::array<Plane, 6>& out);
     };
 
 } // namespace lfs::training::tide

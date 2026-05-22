@@ -15,6 +15,12 @@
 
 #include <cstddef>
 #include <memory>
+#include <vector>
+
+namespace lfs::core {
+    class BlockStore;
+    class TieredCache;
+} // namespace lfs::core
 
 namespace lfs::training {
 
@@ -70,6 +76,19 @@ namespace lfs::training {
         /// behavior (standard AdamOptimizer over the view-backed SplatData).
         void set_working_set(std::shared_ptr<tide::WorkingSet> working_set);
 
+        /// Phase 3.5.2: hand the strategy the BlockStore (for per-iter bounds
+        /// snapshots fed to the frustum culler) and the TieredCache (for the
+        /// `WorkingSet::load_and_activate` source on a frustum-miss).
+        ///
+        /// Both pointers must outlive the strategy (TideRuntime owns them).
+        /// When the strategy has a WorkingSet AND both sources, `pre_forward`
+        /// performs full frustum-driven residency selection per iteration.
+        /// When either source is null the strategy falls back to the Phase
+        /// 3.5.1 behavior (no-op pre_forward, resident set established by an
+        /// external `activate_all_blocks` call).
+        void set_tide_sources(std::shared_ptr<lfs::core::BlockStore> store,
+                              lfs::core::TieredCache* cache);
+
         // IStrategy interface ----------------------------------------------
         void initialize(const lfs::core::param::OptimizationParameters& optimParams) override;
         void pre_forward(int iter, const lfs::core::Camera& cam) override;
@@ -103,6 +122,19 @@ namespace lfs::training {
         const tide::TideResidentAdam* get_resident_adam() const noexcept;
         /// Access the attached WorkingSet (may be null).
         tide::WorkingSet* get_working_set() noexcept;
+
+        // Phase 3.5.2 test accessors --------------------------------------
+        /// Number of blocks the most recent `pre_forward` call selected as
+        /// visible. 0 before the first call, or when sources are missing.
+        std::size_t last_visible_block_count() const noexcept;
+        /// Snapshot of the visible block_id list from the most recent
+        /// `pre_forward` (caller copies; vector reference is invalidated on
+        /// the next `pre_forward`).
+        const std::vector<std::size_t>& last_visible_block_ids() const noexcept;
+        /// True iff the most recent `pre_forward` actually called
+        /// `WorkingSet::load_and_activate` (vs. skipping because the visible
+        /// set was unchanged). 0 before the first call.
+        bool last_pre_forward_loaded() const noexcept;
 
     private:
         struct Impl;

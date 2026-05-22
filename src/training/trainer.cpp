@@ -1208,18 +1208,16 @@ namespace lfs::training {
             strategy_->initialize(params.optimization);
             LOG_DEBUG("Strategy initialized");
 
-            // Phase 3.3b: full-residency single-tile mode. Bring every store
-            // block into the WorkingSet exactly once, after initialize so the
-            // strategy's SOA scratch is allocated. Phase 3.5 will replace this
-            // with frustum-driven per-iteration prefetch.
+            // Phase 3.5.2: Tide residency is now driven by TideStrategy::pre_forward
+            // (frustum cull → WorkingSet::load_and_activate per iteration). The
+            // first pre_forward call performs the initial sync load that the old
+            // `activate_all_blocks` used to perform up-front. Subsequent iterations
+            // skip the load when the resident set is unchanged (perf parity with
+            // the previous full-residency mode).
             if (tide_runtime_) {
-                auto act = lfs::training::tide::activate_all_blocks(*tide_runtime_);
-                if (!act) {
-                    return std::unexpected("Tide activate_all_blocks failed: " + act.error());
-                }
-                LOG_INFO("Tide: {} blocks resident in WorkingSet ({} Gaussians)",
-                         tide_runtime_->working_set->active_block_count(),
-                         tide_runtime_->working_set->active_gaussian_count());
+                LOG_INFO("Tide: residency will be established on first pre_forward "
+                         "({} blocks resident capacity)",
+                         tide_runtime_->effective_capacity_blocks);
             }
 
             // Initialize bilateral grid if enabled

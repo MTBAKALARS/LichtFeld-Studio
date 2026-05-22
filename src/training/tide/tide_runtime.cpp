@@ -83,6 +83,13 @@ namespace lfs::training::tide {
             return std::unexpected(std::string("attach_tide_working_set: set_working_set failed: ") + e.what());
         }
 
+        // 5a) Phase 3.5.2: hand the strategy the BlockStore (for per-iter
+        // bounds snapshots fed to FrustumCuller) and the TieredCache (the
+        // byte source for `WorkingSet::load_and_activate`). Lifetimes are
+        // covered by the returned TideRuntime, which owns both and outlives
+        // the strategy by trainer construction.
+        strategy.set_tide_sources(store, cache.get());
+
         LOG_INFO("Tide runtime attached: store={} ({} blocks, {} B/block); WS capacity={}, cache capacity={}",
                  lfs::core::path_to_utf8(opt.tide_store_path),
                  n_blocks, store->bytes_per_block(), ws_capacity, cache_capacity);

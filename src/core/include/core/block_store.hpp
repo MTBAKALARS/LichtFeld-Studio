@@ -218,6 +218,12 @@ namespace lfs::core {
         /// Get the bounding sphere for a block. Bounds are mutable across writes via @ref update_bounds.
         BlockBounds get_bounds(std::size_t block_id) const;
 
+        /// Bulk snapshot all per-block bounds under a single mutex acquisition.
+        /// Resizes @p out to `num_blocks()` and copies the current bounds vector.
+        /// Used by Tide pre_forward to feed the frustum culler once per iteration
+        /// without paying num_blocks() lock acquisitions.
+        void snapshot_bounds(std::vector<BlockBounds>& out) const;
+
         /// Refresh the bounding sphere for a block (e.g. after centers move during training).
         void update_bounds(std::size_t block_id, const BlockBounds& bounds);
 

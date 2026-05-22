@@ -14,9 +14,13 @@
 
 #include "strategies/tide_strategy.hpp"
 
+#include "core/block_store.hpp"
+#include "core/camera.hpp"
 #include "core/logger.hpp"
+#include "core/tiered_cache.hpp"
 #include "strategies/strategy_utils.hpp"
 #include "tide/aos_soa_repack.hpp"
+#include "tide/frustum_culler.hpp"
 #include "tide/working_set.hpp"
 
 #include <algorithm>
@@ -26,6 +30,7 @@
 #include <cstring>
 #include <cuda_runtime.h>
 #include <istream>
+#include <numeric>
 #include <ostream>
 #include <stdexcept>
 #include <string>
@@ -116,6 +121,34 @@ namespace lfs::training {
         // Phase 3.3 will route the .step() path through this instead of
         // `optimizer`.
         std::unique_ptr<tide::TideResidentAdam> resident_adam;
+
+        // Phase 3.5.2 frustum-driven streaming sources.
+        // BlockStore supplies per-block bounding spheres (snapshotted into
+        // `bounds_scratch` once per pre_forward); TieredCache supplies the
+        // pinned-host bytes for `WorkingSet::load_and_activate` on a miss.
+        std::shared_ptr<lfs::core::BlockStore> store;
+        lfs::core::TieredCache* cache = nullptr;
+
+        // Camera-space near/far for frustum plane construction. Conservative
+        // defaults — far is intentionally huge so distant scene blocks are
+        // never near/far-culled by accident. Phase 3.5.4 will tighten these
+        // from the scene scale.
+        float frustum_near = 0.01f;
+        float frustum_far  = 1.0e6f;
+
+        // Reusable scratch buffers — avoid per-iter allocations.
+        std::vector<lfs::core::BlockStore::BlockBounds> bounds_scratch;
+        std::vector<std::size_t> visible_scratch;
+        std::vector<std::size_t> resident_scratch; ///< Block IDs passed to load_and_activate.
+        std::array<tide::FrustumCuller::Plane, 6> planes_scratch{};
+
+        // Phase 3.5.2 telemetry / test surfaces.
+        std::vector<std::size_t> last_visible_ids;
+        bool last_pre_forward_loaded = false;
+        // What `resident_scratch` looked like on the most recent
+        // load_and_activate. Compared against the next `resident_scratch`
+        // to skip a redundant load when the resident set is unchanged.
+        std::vector<std::size_t> last_loaded_ids;
 
         void free_scratch() noexcept {
             const std::array<float**, 6> ptrs{&d_means, &d_scaling, &d_rotation,
@@ -330,19 +363,96 @@ namespace lfs::training {
 
     // ----------------------------------------------------------------------
 
-    void TideStrategy::pre_forward(int /*iter*/, const lfs::core::Camera& /*cam*/) {
-        // Phase 3.5.1: callback wiring only. The trainer now invokes this hook
-        // every iteration (just after camera selection, just before
-        // rasterize_forward) regardless of whether a WorkingSet is attached.
-        // Behavior is intentionally a no-op so this commit is a pure refactor:
-        // the WorkingSet's resident set continues to be populated up-front by
-        // trainer init via `activate_all_blocks`.
+    void TideStrategy::pre_forward(int iter, const lfs::core::Camera& cam) {
+        // Phase 3.5.2 — frustum-driven residency hook.
         //
-        // Phase 3.5.2 will move the activation here: compute the camera's 6
-        // frustum planes, run FrustumCuller against block bounds, and request
-        // the visible block IDs from the WorkingSet (sync first, then async).
-        // From that point on, the trainer-side `activate_all_blocks` call
-        // becomes unreachable and is removed.
+        // Preconditions for the "real" path (all three must hold):
+        //   - a WorkingSet is attached (set via set_working_set in attach_tide_working_set);
+        //   - a BlockStore is attached (set via set_tide_sources, for bounds);
+        //   - a TieredCache is attached (set via set_tide_sources, for byte source).
+        // If any is missing the call is a no-op, matching the Phase 3.5.1
+        // fallback behavior (resident set established elsewhere).
+        if (!impl_->working_set || !impl_->store || !impl_->cache) {
+            impl_->last_pre_forward_loaded = false;
+            return;
+        }
+
+        // 1. Snapshot per-block bounds under one BlockStore lock acquisition.
+        impl_->store->snapshot_bounds(impl_->bounds_scratch);
+        const std::size_t num_blocks = impl_->bounds_scratch.size();
+        if (num_blocks == 0) {
+            // Empty store — nothing to do. Should not happen in practice
+            // (open() rejects 0-block stores), but guard cleanly.
+            impl_->last_visible_ids.clear();
+            impl_->last_pre_forward_loaded = false;
+            return;
+        }
+
+        // 2. Compute world-space frustum planes for this camera.
+        tide::FrustumCuller::compute_frustum_planes(
+            cam, impl_->frustum_near, impl_->frustum_far, impl_->planes_scratch);
+
+        // 3. Cull all block bounding spheres against the 6 planes.
+        tide::FrustumCuller::cull(
+            std::span<const lfs::core::BlockStore::BlockBounds>(
+                impl_->bounds_scratch.data(), impl_->bounds_scratch.size()),
+            std::span<const tide::FrustumCuller::Plane, 6>(impl_->planes_scratch),
+            impl_->visible_scratch);
+
+        // 4. Publish telemetry. The visible list is what the camera ACTUALLY
+        //    sees this iteration — this is the input that Phase 3.5.4 will
+        //    forward to WorkingSet, once per-block Adam moments (Phase 3.5.3)
+        //    have made variable residency safe.
+        impl_->last_visible_ids = impl_->visible_scratch;
+
+        // 5. Build the resident set we will hand to WorkingSet.
+        //
+        // *** Phase 3.5.2 design note (read carefully) ***
+        // TideResidentAdam stores first/second-moment buffers as flat,
+        // contiguous device arrays indexed by **position within the active
+        // SOA**, not by block_id (Phase 3.1 deliberately landed the simplest
+        // possible per-tile Adam). If we drove residency from the visible set
+        // here, the active-SOA position of any given block_id would change
+        // every iteration as cameras rotate, but the Adam moments would not
+        // follow — Gaussian i's m/v from iter N would be applied to a
+        // completely different Gaussian at iter N+1.
+        //
+        // Phase 3.5.3 (Adam moments stored per-block, paper Sec. 3.4) is the
+        // prerequisite that makes variable residency numerically safe. Until
+        // that lands, we deliberately force the resident set to include
+        // every block in the store. The frustum cull result above is computed
+        // (and validated by tests) but not yet acted on.
+        //
+        // This is intentional, not lazy: it preserves Phase 3.4c's exact
+        // training trajectory while moving the activation call site from
+        // trainer init into pre_forward, which is the architectural change
+        // 3.5.2 is responsible for.
+        impl_->resident_scratch.resize(num_blocks);
+        std::iota(impl_->resident_scratch.begin(), impl_->resident_scratch.end(), std::size_t{0});
+
+        // 6. Skip the load entirely when the resident set is identical to
+        //    last time. For the all-blocks case this fires exactly once per
+        //    training run (iter 0), giving v24 perf parity with Phase 3.4c.
+        impl_->last_pre_forward_loaded = false;
+        if (impl_->resident_scratch == impl_->last_loaded_ids) {
+            return;
+        }
+
+        // 7. Synchronous load. Phase 3.5.6 will swap this for a pipelined
+        //    prefetch (iter N+1's set staged while iter N computes), which is
+        //    what unlocks SSD-bound 1B training. For 3.5.2 a blocking load
+        //    matches what activate_all_blocks used to do.
+        auto result = impl_->working_set->load_and_activate(
+            *impl_->cache,
+            std::span<const std::size_t>(impl_->resident_scratch.data(),
+                                         impl_->resident_scratch.size()));
+        if (!result) {
+            throw std::runtime_error(
+                "TideStrategy::pre_forward: WorkingSet::load_and_activate failed at iter " +
+                std::to_string(iter) + ": " + result.error());
+        }
+        impl_->last_loaded_ids = impl_->resident_scratch;
+        impl_->last_pre_forward_loaded = true;
     }
 
     void TideStrategy::pre_step(int /*iter*/, RenderOutput& /*render_output*/) {
@@ -576,6 +686,29 @@ namespace lfs::training {
                 "(SOA scratch is already sized)");
         }
         impl_->working_set = std::move(working_set);
+    }
+
+    void TideStrategy::set_tide_sources(std::shared_ptr<lfs::core::BlockStore> store,
+                                        lfs::core::TieredCache* cache) {
+        // Unlike set_working_set, this is safe to call either before or after
+        // initialize(): pre_forward checks the pointers on every call and
+        // simply no-ops when either is missing. Allowing late attachment keeps
+        // the trainer wire-up order flexible.
+        impl_->store = std::move(store);
+        impl_->cache = cache;
+    }
+
+    std::size_t TideStrategy::last_visible_block_count() const noexcept {
+        return impl_ ? impl_->last_visible_ids.size() : 0u;
+    }
+
+    const std::vector<std::size_t>& TideStrategy::last_visible_block_ids() const noexcept {
+        static const std::vector<std::size_t> empty;
+        return impl_ ? impl_->last_visible_ids : empty;
+    }
+
+    bool TideStrategy::last_pre_forward_loaded() const noexcept {
+        return impl_ ? impl_->last_pre_forward_loaded : false;
     }
 
 } // namespace lfs::training
