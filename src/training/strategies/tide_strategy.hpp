@@ -150,6 +150,22 @@ namespace lfs::training {
         /// set was unchanged). 0 before the first call.
         bool last_pre_forward_loaded() const noexcept;
 
+        // Phase 3.5.4 test accessors --------------------------------------
+        /// True iff the most recent `pre_forward` exercised the LRU+visibility
+        /// eviction branch (moments enabled AND num_blocks > capacity). False
+        /// for the iota-all-blocks fast path (legacy v1 stores or v2 stores
+        /// that fit fully in WorkingSet capacity).
+        bool last_pre_forward_used_lru() const noexcept;
+        /// Per-block last-used iteration counter. Returns -1 if the block has
+        /// never been resident (i.e. never selected in any `pre_forward`).
+        /// In-process only — no checkpoint persistence (future phase).
+        std::int64_t block_last_used_iter(std::size_t block_id) const noexcept;
+        /// Snapshot of the resident block_id list from the most recent
+        /// `pre_forward` (caller copies; vector reference is invalidated on
+        /// the next `pre_forward`). For the LRU path this is the visible set
+        /// plus the LRU-fill blocks, sorted ascending by block_id.
+        const std::vector<std::size_t>& last_resident_block_ids() const noexcept;
+
     private:
         struct Impl;
         std::unique_ptr<Impl> impl_;

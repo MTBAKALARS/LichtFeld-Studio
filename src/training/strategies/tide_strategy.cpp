@@ -35,6 +35,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace lfs::training {
@@ -226,6 +227,19 @@ namespace lfs::training {
         // Telemetry: number of blocks the most recent v2 step iterated over.
         // Zero on the legacy v1 path (moments disabled).
         std::size_t last_step_block_count = 0;
+
+        // Phase 3.5.4: per-block last-used iteration counter, keyed by global
+        // block_id. Stamped to `iter` for every block that is made resident in
+        // pre_forward (i.e. every visible block + every LRU-fill block). Used
+        // when `|visible| < capacity < num_blocks` to pick which non-visible
+        // blocks fill the remaining slots (highest last_used_iter wins).
+        // In-process only; not persisted across restarts.
+        std::unordered_map<std::size_t, std::int64_t> block_last_used_iter;
+
+        // Phase 3.5.4 telemetry: did the most recent `pre_forward` exercise
+        // the LRU eviction branch (moments_enabled && num_blocks > capacity)?
+        // Equals false for the iota-all-blocks fast path.
+        bool last_pre_forward_used_lru = false;
 
         void free_scratch() noexcept {
             const std::array<float**, 6> ptrs{&d_means, &d_scaling, &d_rotation,
@@ -548,28 +562,91 @@ namespace lfs::training {
 
         // 5. Build the resident set we will hand to WorkingSet.
         //
-        // *** Phase 3.5.2 design note (read carefully) ***
-        // TideResidentAdam stores first/second-moment buffers as flat,
-        // contiguous device arrays indexed by **position within the active
-        // SOA**, not by block_id (Phase 3.1 deliberately landed the simplest
-        // possible per-tile Adam). If we drove residency from the visible set
-        // here, the active-SOA position of any given block_id would change
-        // every iteration as cameras rotate, but the Adam moments would not
-        // follow — Gaussian i's m/v from iter N would be applied to a
-        // completely different Gaussian at iter N+1.
+        // *** Phase 3.5.4 — three-mode policy ***
         //
-        // Phase 3.5.3 (Adam moments stored per-block, paper Sec. 3.4) is the
-        // prerequisite that makes variable residency numerically safe. Until
-        // that lands, we deliberately force the resident set to include
-        // every block in the store. The frustum cull result above is computed
-        // (and validated by tests) but not yet acted on.
+        // Mode A (legacy v1, no moments): TideResidentAdam stores per-Gaussian
+        // m/v as flat arrays indexed by SOA position. Variable residency is
+        // unsafe (block_id <-> SOA position would scramble across iters), so
+        // we keep iota-all-blocks. v24 single-tile training stays on this path.
         //
-        // This is intentional, not lazy: it preserves Phase 3.4c's exact
-        // training trajectory while moving the activation call site from
-        // trainer init into pre_forward, which is the architectural change
-        // 3.5.2 is responsible for.
-        impl_->resident_scratch.resize(num_blocks);
-        std::iota(impl_->resident_scratch.begin(), impl_->resident_scratch.end(), std::size_t{0});
+        // Mode B (v2, store fits in capacity): no eviction needed — iota-all.
+        // This is the common "moments bake but still single-tile" path.
+        //
+        // Mode C (v2, store > capacity): the actual out-of-core path. Visible
+        // blocks are protected (must be resident); remaining slots are filled
+        // with the most-recently-used non-visible blocks (LRU). Per-block
+        // moments make this numerically safe — Phase 3.5.3e-2 wired it.
+        const bool moments_enabled = impl_->working_set->moments_bytes_per_block() > 0;
+        const std::size_t capacity = impl_->working_set->config().capacity_blocks;
+        impl_->last_pre_forward_used_lru = false;
+
+        if (!moments_enabled || num_blocks <= capacity) {
+            impl_->resident_scratch.resize(num_blocks);
+            std::iota(impl_->resident_scratch.begin(), impl_->resident_scratch.end(), std::size_t{0});
+        } else {
+            // Mode C: visible-first + LRU fill.
+            impl_->last_pre_forward_used_lru = true;
+            impl_->resident_scratch.clear();
+            impl_->resident_scratch.reserve(capacity);
+
+            // Build a fast lookup for visibility membership.
+            std::unordered_set<std::size_t> visible_set(
+                impl_->visible_scratch.begin(), impl_->visible_scratch.end());
+
+            // Visible blocks ALWAYS resident — fail loudly when the visible
+            // set alone exceeds capacity (the operator must raise
+            // --tide-capacity-blocks or accept lower-quality coarser tiling;
+            // silently dropping visible blocks would produce holes in the
+            // render).
+            if (visible_set.size() > capacity) {
+                throw std::runtime_error(
+                    "TideStrategy::pre_forward: visible set size " +
+                    std::to_string(visible_set.size()) +
+                    " exceeds WorkingSet capacity " + std::to_string(capacity) +
+                    " at iter " + std::to_string(iter) +
+                    " - increase --tide-capacity-blocks");
+            }
+            for (auto vid : impl_->visible_scratch) {
+                impl_->resident_scratch.push_back(vid);
+            }
+
+            // Fill remaining slots with non-visible blocks by descending
+            // last_used_iter (most recently used first). Blocks never resident
+            // tie-break at -1, i.e. lowest priority.
+            const std::size_t remaining = capacity - visible_set.size();
+            if (remaining > 0 && num_blocks > visible_set.size()) {
+                std::vector<std::pair<std::int64_t, std::size_t>> candidates;
+                candidates.reserve(num_blocks - visible_set.size());
+                for (std::size_t bid = 0; bid < num_blocks; ++bid) {
+                    if (visible_set.count(bid)) continue;
+                    auto it = impl_->block_last_used_iter.find(bid);
+                    const std::int64_t lui = (it == impl_->block_last_used_iter.end())
+                                                 ? std::int64_t{-1}
+                                                 : it->second;
+                    candidates.emplace_back(lui, bid);
+                }
+                const std::size_t k = std::min(remaining, candidates.size());
+                if (k < candidates.size()) {
+                    // Partition top k by first (last_used_iter) desc.
+                    std::nth_element(
+                        candidates.begin(), candidates.begin() + k, candidates.end(),
+                        [](const auto& a, const auto& b) { return a.first > b.first; });
+                }
+                for (std::size_t i = 0; i < k; ++i) {
+                    impl_->resident_scratch.push_back(candidates[i].second);
+                }
+            }
+
+            // Sort for deterministic ordering + equality-skip check below.
+            std::sort(impl_->resident_scratch.begin(), impl_->resident_scratch.end());
+        }
+
+        // Stamp last_used_iter for every block we are about to make resident.
+        // This includes both visible blocks AND LRU-fill blocks; the latter
+        // are "kept warm" by being resident even if not directly rendered.
+        for (auto bid : impl_->resident_scratch) {
+            impl_->block_last_used_iter[bid] = static_cast<std::int64_t>(iter);
+        }
 
         // 6. Skip the load entirely when the resident set is identical to
         //    last time. For the all-blocks case this fires exactly once per
@@ -1020,6 +1097,21 @@ namespace lfs::training {
 
     bool TideStrategy::last_pre_forward_loaded() const noexcept {
         return impl_ ? impl_->last_pre_forward_loaded : false;
+    }
+
+    bool TideStrategy::last_pre_forward_used_lru() const noexcept {
+        return impl_ ? impl_->last_pre_forward_used_lru : false;
+    }
+
+    std::int64_t TideStrategy::block_last_used_iter(std::size_t block_id) const noexcept {
+        if (!impl_) return -1;
+        const auto it = impl_->block_last_used_iter.find(block_id);
+        return it == impl_->block_last_used_iter.end() ? std::int64_t{-1} : it->second;
+    }
+
+    const std::vector<std::size_t>& TideStrategy::last_resident_block_ids() const noexcept {
+        static const std::vector<std::size_t> empty;
+        return impl_ ? impl_->resident_scratch : empty;
     }
 
 } // namespace lfs::training
