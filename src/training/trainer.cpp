@@ -31,6 +31,8 @@
 #include "rasterization/gsplat_rasterizer.hpp"
 #include "strategies/mcmc.hpp"
 #include "strategies/strategy_factory.hpp"
+#include "strategies/tide_strategy.hpp"
+#include "tide/tide_runtime.hpp"
 #include "training/kernels/grad_alpha.hpp"
 #include "training/kernels/mrnf_kernels.hpp"
 
@@ -1164,10 +1166,35 @@ namespace lfs::training {
                 LOG_DEBUG("Created {} strategy from Scene model", params.optimization.strategy);
             }
 
+            // Phase 3.3b: if strategy is 'tide' and a BlockStore path was given,
+            // build the BlockStore/TieredCache/WorkingSet bundle and attach the
+            // WorkingSet to the strategy BEFORE initialize. The Trainer owns
+            // the runtime so it outlives the strategy.
+            const bool tide_active =
+                (lfs::core::param::canonical_strategy_name(params.optimization.strategy) ==
+                 lfs::core::param::kStrategyTide) &&
+                !params.optimization.tide_store_path.empty();
+            if (tide_active) {
+                auto* tide_strategy = dynamic_cast<lfs::training::TideStrategy*>(strategy_.get());
+                if (!tide_strategy) {
+                    return std::unexpected(
+                        "Strategy is 'tide' but dynamic_cast<TideStrategy*> failed");
+                }
+                auto rt = lfs::training::tide::attach_tide_working_set(
+                    *tide_strategy, params.optimization);
+                if (!rt) {
+                    return std::unexpected("Tide attach failed: " + rt.error());
+                }
+                tide_runtime_ = std::make_unique<lfs::training::tide::TideRuntime>(
+                    std::move(rt.value()));
+                LOG_INFO("Tide WorkingSet attached: {} blocks resident capacity",
+                         tide_runtime_->effective_capacity_blocks);
+            }
+
             auto& splat = strategy_->get_model();
 
             int max_cap = params.optimization.max_cap;
-            if (max_cap < splat.size()) {
+            if (!tide_active && max_cap < splat.size()) {
                 LOG_WARN("Max cap is less than to {} initial splats {}. Choosing randomly {} splats", max_cap, splat.size(), max_cap);
                 lfs::core::random_choose(splat, max_cap);
             }
@@ -1176,6 +1203,20 @@ namespace lfs::training {
             strategy_->set_training_dataset(train_dataset_);
             strategy_->initialize(params.optimization);
             LOG_DEBUG("Strategy initialized");
+
+            // Phase 3.3b: full-residency single-tile mode. Bring every store
+            // block into the WorkingSet exactly once, after initialize so the
+            // strategy's SOA scratch is allocated. Phase 3.5 will replace this
+            // with frustum-driven per-iteration prefetch.
+            if (tide_runtime_) {
+                auto act = lfs::training::tide::activate_all_blocks(*tide_runtime_);
+                if (!act) {
+                    return std::unexpected("Tide activate_all_blocks failed: " + act.error());
+                }
+                LOG_INFO("Tide: {} blocks resident in WorkingSet ({} Gaussians)",
+                         tide_runtime_->working_set->active_block_count(),
+                         tide_runtime_->working_set->active_gaussian_count());
+            }
 
             // Initialize bilateral grid if enabled
             if (auto result = initialize_bilateral_grid(); !result) {
@@ -1520,6 +1561,7 @@ namespace lfs::training {
 
         clearActiveImageLoader();
         strategy_.reset();
+        tide_runtime_.reset();
         bilateral_grid_.reset();
         ppisp_.reset();
         ppisp_controller_pool_.reset();

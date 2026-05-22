@@ -173,6 +173,13 @@ namespace lfs::core {
             // Tile mode for memory-efficient training (1=1 tile, 2=2 tiles, 4=4 tiles)
             int tile_mode = 1;
 
+            // Tide (out-of-core training via BlockStore + WorkingSet) parameters.
+            // Only consulted when strategy == kStrategyTide. When tide_store_path
+            // is empty, TideStrategy falls back to the in-VRAM shell behavior.
+            std::filesystem::path tide_store_path = {};        ///< Existing BlockStore directory on disk.
+            size_t tide_capacity_blocks = 0;                   ///< WorkingSet capacity in blocks. 0 = min(store.num_blocks, default).
+            size_t tide_cache_capacity_blocks = 0;             ///< TieredCache capacity in blocks. 0 = 2 * effective WS capacity.
+
             // Sparsity optimization parameters
             bool enable_sparsity = false;
             int sparsify_steps = 15000;

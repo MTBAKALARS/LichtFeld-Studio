@@ -33,6 +33,11 @@ namespace lfs::core {
 }
 
 namespace lfs::training {
+
+    // Forward decl for Tide (out-of-core) runtime — defined in tide/tide_runtime.hpp
+    namespace tide {
+        struct TideRuntime;
+    } // namespace tide
     class AdamOptimizer;
     struct PPISPFileMetadata;
 
@@ -307,6 +312,9 @@ namespace lfs::training {
         std::shared_ptr<CameraDataset> val_dataset_;
         std::shared_ptr<lfs::io::PipelinedImageLoader> active_image_loader_;
         std::unique_ptr<IStrategy> strategy_;
+        // Optional out-of-core BlockStore/TieredCache/WorkingSet bundle for the
+        // 'tide' strategy. Owned by the Trainer so it outlives the strategy.
+        std::unique_ptr<lfs::training::tide::TideRuntime> tide_runtime_;
         lfs::core::param::TrainingParameters params_;
         std::optional<std::tuple<std::vector<std::string>, std::vector<std::string>>> provided_splits_;
 

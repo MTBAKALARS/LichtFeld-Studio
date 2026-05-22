@@ -93,6 +93,7 @@ set(TRAINING_NEW_SOURCES
     tide/working_set.cpp
     tide/frustum_culler.cpp
     tide/aos_soa_repack.cu
+    tide/tide_runtime.cpp
     optimizer/tide_resident_adam.cpp
     checkpoint.cpp
     trainer.cpp

@@ -147,6 +147,11 @@ namespace lfs::core {
             opt_json["init_num_pts"] = init_num_pts;
             opt_json["init_extent"] = init_extent;
             opt_json["tile_mode"] = tile_mode;
+            if (!tide_store_path.empty()) {
+                opt_json["tide_store_path"] = path_to_utf8(tide_store_path);
+            }
+            opt_json["tide_capacity_blocks"] = tide_capacity_blocks;
+            opt_json["tide_cache_capacity_blocks"] = tide_cache_capacity_blocks;
             opt_json["enable_sparsity"] = enable_sparsity;
             opt_json["sparsify_steps"] = sparsify_steps;
             opt_json["init_rho"] = init_rho;
@@ -294,6 +299,16 @@ namespace lfs::core {
             }
             if (json.contains("max_cap")) {
                 params.max_cap = json["max_cap"];
+            }
+
+            if (json.contains("tide_store_path")) {
+                params.tide_store_path = lfs::core::utf8_to_path(json["tide_store_path"].get<std::string>());
+            }
+            if (json.contains("tide_capacity_blocks")) {
+                params.tide_capacity_blocks = json["tide_capacity_blocks"].get<size_t>();
+            }
+            if (json.contains("tide_cache_capacity_blocks")) {
+                params.tide_cache_capacity_blocks = json["tide_cache_capacity_blocks"].get<size_t>();
             }
 
             if (json.contains("strategy")) {
