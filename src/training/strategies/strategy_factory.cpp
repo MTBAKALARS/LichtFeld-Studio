@@ -7,6 +7,7 @@
 #include "improved_gs_plus.hpp"
 #include "mcmc.hpp"
 #include "mrnf.hpp"
+#include "tide_strategy.hpp"
 #include <format>
 #include <mutex>
 
@@ -42,6 +43,11 @@ namespace lfs::training {
         registry_[std::string(core::param::kStrategyIGSPlus)] = [](core::SplatData& model)
             -> std::expected<std::unique_ptr<IStrategy>, std::string> {
             return std::make_unique<ImprovedGSPlus>(model);
+        };
+
+        registry_[std::string(core::param::kStrategyTide)] = [](core::SplatData& model)
+            -> std::expected<std::unique_ptr<IStrategy>, std::string> {
+            return std::make_unique<TideStrategy>(model);
         };
     }
 

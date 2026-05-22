@@ -78,6 +78,7 @@ set(TRAINING_NEW_SOURCES
     strategies/mrnf.cpp
     strategies/strategy_factory.cpp
     strategies/improved_gs_plus.cpp
+    strategies/tide_strategy.cpp
     rasterization/fast_rasterizer.cpp
     rasterization/gsplat_rasterizer.cpp
     rasterization/edge_rasterizer.cpp

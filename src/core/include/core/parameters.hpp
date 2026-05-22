@@ -38,6 +38,7 @@ namespace lfs::core {
         inline constexpr std::string_view kStrategyMNRFLegacy = "mnrf";
         inline constexpr std::string_view kStrategyLFSLegacy = "lfs";
         inline constexpr std::string_view kStrategyIGSPlus = "igs+";
+        inline constexpr std::string_view kStrategyTide = "tide";
 
         [[nodiscard]] inline constexpr std::string_view canonical_strategy_name(const std::string_view strategy) noexcept {
             if (strategy == kStrategyMCMC)
@@ -46,6 +47,8 @@ namespace lfs::core {
                 return kStrategyMRNF;
             if (strategy == kStrategyIGSPlus)
                 return kStrategyIGSPlus;
+            if (strategy == kStrategyTide)
+                return kStrategyTide;
             return {};
         }
 
