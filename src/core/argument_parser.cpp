@@ -106,7 +106,7 @@ namespace {
             ::args::Group training_sep(parser, " ");
             ::args::Group training_group(parser, "TRAINING PARAMETERS:");
             ::args::ValueFlag<uint32_t> iterations(training_group, "iterations", "Number of iterations", {'i', "iter"});
-            ::args::ValueFlag<std::string> strategy(training_group, "strategy", "Optimization strategy: mcmc, mrnf, igs+ (legacy aliases: mnrf, lfs)", {"strategy"});
+            ::args::ValueFlag<std::string> strategy(training_group, "strategy", "Optimization strategy: mcmc, mrnf, igs+, tide (legacy aliases: mnrf, lfs)", {"strategy"});
             ::args::ValueFlag<int> sh_degree(training_group, "sh_degree", "Max SH degree [0-3]", {"sh-degree"});
             ::args::ValueFlag<int> sh_degree_interval(training_group, "sh_degree_interval", "SH degree interval", {"sh-degree-interval"});
             ::args::ValueFlag<int> max_cap(training_group, "max_cap", "Maximum number of Gaussians", {"max-cap"});
@@ -115,6 +115,11 @@ namespace {
             ::args::ValueFlag<int> tile_mode(training_group, "tile_mode", "Tile mode for memory-efficient training: 1=1 tile, 2=2 tiles, 4=4 tiles (default: 1)", {"tile-mode"});
             ::args::Flag use_error_map(training_group, "use_error_map", "Weight MRNF refine signal by per-pixel SSIM error map", {"use-error-map"});
             ::args::Flag use_edge_map(training_group, "use_edge_map", "Weight MRNF refine signal by Sobel edge map on GT images", {"use-edge-map"});
+
+            // Tide (out-of-core) parameters — only consulted when --strategy=tide.
+            ::args::ValueFlag<std::string> tide_store(training_group, "tide_store", "Path to existing BlockStore directory for the 'tide' strategy (required to enable out-of-core training)", {"tide-store"});
+            ::args::ValueFlag<uint64_t> tide_capacity_blocks(training_group, "tide_capacity_blocks", "Tide WorkingSet capacity in blocks (0 = use store.num_blocks)", {"tide-capacity-blocks"});
+            ::args::ValueFlag<uint64_t> tide_cache_capacity_blocks(training_group, "tide_cache_capacity_blocks", "Tide TieredCache capacity in blocks (0 = 2x WorkingSet capacity)", {"tide-cache-capacity-blocks"});
 
             // =============================================================================
             // INITIALIZATION
@@ -536,6 +541,9 @@ namespace {
                                         timelapse_images_val = cli_option_present({"--timelapse-images"}) ? std::optional<std::vector<std::string>>(::args::get(timelapse_images)) : std::optional<std::vector<std::string>>(),
                                         timelapse_every_val = cli_option_present({"--timelapse-every"}) ? std::optional<int>(::args::get(timelapse_every)) : std::optional<int>(),
                                         tile_mode_val = cli_option_present({"--tile-mode"}) ? std::optional<int>(::args::get(tile_mode)) : std::optional<int>(),
+                                        tide_store_val = cli_option_present({"--tide-store"}) ? std::optional<std::string>(::args::get(tide_store)) : std::optional<std::string>(),
+                                        tide_capacity_blocks_val = cli_option_present({"--tide-capacity-blocks"}) ? std::optional<uint64_t>(::args::get(tide_capacity_blocks)) : std::optional<uint64_t>(),
+                                        tide_cache_capacity_blocks_val = cli_option_present({"--tide-cache-capacity-blocks"}) ? std::optional<uint64_t>(::args::get(tide_cache_capacity_blocks)) : std::optional<uint64_t>(),
                                         // Sparsity parameters
                                         sparsify_steps_val = cli_option_present({"--sparsify-steps"}) ? std::optional<int>(::args::get(sparsify_steps)) : std::optional<int>(),
                                         init_rho_val = cli_option_present({"--init-rho"}) ? std::optional<float>(::args::get(init_rho)) : std::optional<float>(),
@@ -609,6 +617,13 @@ namespace {
                 setVal(timelapse_every_val, ds.timelapse_every);
                 setVal(output_name_val, ds.output_name);
                 setVal(tile_mode_val, opt.tile_mode);
+
+                // Tide (out-of-core) overrides — only effective when opt.strategy == "tide".
+                if (tide_store_val) {
+                    opt.tide_store_path = lfs::core::utf8_to_path(*tide_store_val);
+                }
+                setVal(tide_capacity_blocks_val, opt.tide_capacity_blocks);
+                setVal(tide_cache_capacity_blocks_val, opt.tide_cache_capacity_blocks);
 
                 // Sparsity parameters
                 setVal(sparsify_steps_val, opt.sparsify_steps);
