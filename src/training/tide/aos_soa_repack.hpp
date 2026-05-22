@@ -62,6 +62,32 @@ namespace lfs::training::tide {
     inline constexpr std::size_t kAosShNMaxFloats = 45;
 
     /**
+     * @brief BlockStore Adam-moments AOS layout constants.
+     *
+     * Per-Gaussian: [m(59) | v(59)] = 118 floats = 472 bytes, where the m
+     * and v sub-blocks each mirror the parameter AOS layout above. This
+     * matches BlockStore::Config::with_moments / moments.bin sidecar
+     * produced by tide-bake --with-moments (Phase 3.5.3a/d).
+     */
+    inline constexpr std::size_t kAosMomentsFloatsPerGaussian = 2 * kAosFloatsPerGaussian;
+    inline constexpr std::size_t kAosMomentsBytesPerGaussian = kAosMomentsFloatsPerGaussian * sizeof(float);
+    inline constexpr std::size_t kAosMomentsOffsetM = 0;
+    inline constexpr std::size_t kAosMomentsOffsetV = kAosFloatsPerGaussian;
+
+    /**
+     * @brief Per-attribute SOA views for the m and v Adam-moment tensors.
+     *
+     * Layout for each of `m` and `v` matches @ref SoaViews exactly (same
+     * per-attribute strides as SplatData's raw tensors). The two views
+     * MUST share the same `num_gaussians` and `shN_floats_per_gaussian`;
+     * the repack kernel rejects mismatches.
+     */
+    struct MomentsSoaViews {
+        SoaViews m;
+        SoaViews v;
+    };
+
+    /**
      * @brief Unpack the WorkingSet's AOS-interleaved device buffer into per-
      *        attribute SOA scratch buffers.
      *
@@ -104,5 +130,52 @@ namespace lfs::training::tide {
     int soa_to_aos(const SoaViews& soa,
                    float* aos_buffer,
                    cudaStream_t stream);
+
+    /**
+     * @brief Unpack the WorkingSet's moments-region AOS buffer (118-float
+     *        per-Gaussian stride) into per-attribute m and v SOA scratch.
+     *
+     * Each Gaussian's 118 contiguous floats are scattered into the twelve
+     * SOA tensors (six per-attribute m + six per-attribute v) at the same
+     * global index. Operates on `soa.m.num_gaussians` Gaussians starting
+     * at the front of `aos_moments`.
+     *
+     * @ref MomentsSoaViews::m and @ref MomentsSoaViews::v must share
+     * `num_gaussians` and `shN_floats_per_gaussian`. ShN handling matches
+     * @ref aos_to_soa: only the first `shN_floats_per_gaussian` floats of
+     * each AOS rest sub-block are written; if `shN_ptr == nullptr` shN is
+     * skipped entirely (independently for m and v).
+     *
+     * Returns 0 on success, non-zero `cudaError_t` cast to int on launch
+     * failure.
+     *
+     * @param aos_moments Device pointer to the AOS moments buffer. Must
+     *                    contain at least
+     *                    `soa.m.num_gaussians * kAosMomentsFloatsPerGaussian`
+     *                    floats of valid data. Typically obtained from
+     *                    `WorkingSet::moments_device_buffer(local_idx)`.
+     * @param soa         Output m and v SOA views (device pointers).
+     * @param stream      CUDA stream (nullptr = default stream).
+     */
+    int moments_aos_to_soa(const float* aos_moments,
+                           const MomentsSoaViews& soa,
+                           cudaStream_t stream);
+
+    /**
+     * @brief Pack per-attribute m and v SOA tensors back into the
+     *        WorkingSet's moments-region AOS buffer.
+     *
+     * Inverse of @ref moments_aos_to_soa. ShN handling matches
+     * @ref soa_to_aos: trailing AOS rest floats past
+     * `shN_floats_per_gaussian` are zero-filled to preserve the
+     * BlockStore on-disk invariant (each rest slot is always 45 floats,
+     * padded with zeros for lower SH degrees), independently for m and v.
+     *
+     * Returns 0 on success, non-zero `cudaError_t` cast to int on launch
+     * failure.
+     */
+    int moments_soa_to_aos(const MomentsSoaViews& soa,
+                           float* aos_moments,
+                           cudaStream_t stream);
 
 } // namespace lfs::training::tide

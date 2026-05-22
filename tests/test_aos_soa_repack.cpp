@@ -344,4 +344,296 @@ namespace {
         EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
     }
 
+    // =====================================================================
+    // Phase 3.5.3e-1 — moments (m+v) AOS↔SOA repack
+    // =====================================================================
+
+    using lfs::training::tide::kAosMomentsBytesPerGaussian;
+    using lfs::training::tide::kAosMomentsFloatsPerGaussian;
+    using lfs::training::tide::kAosMomentsOffsetM;
+    using lfs::training::tide::kAosMomentsOffsetV;
+    using lfs::training::tide::MomentsSoaViews;
+
+    // Per-block sanity: 118 floats / 472 bytes per Gaussian.
+    static_assert(kAosMomentsFloatsPerGaussian == 118,
+                  "Moments AOS stride must be 2 × kAosFloatsPerGaussian (118)");
+    static_assert(kAosMomentsBytesPerGaussian == 472,
+                  "Moments AOS stride must be 472 bytes (118 floats × 4)");
+    static_assert(kAosMomentsOffsetV == kAosFloatsPerGaussian,
+                  "v sub-block must start at 59 (right after m)");
+
+    // Pattern generator for the 118-float moments AOS slot.
+    std::vector<float> make_moments_aos_pattern(std::size_t num_gaussians, std::uint32_t seed) {
+        std::vector<float> v(num_gaussians * kAosMomentsFloatsPerGaussian);
+        std::mt19937 rng(seed);
+        std::uniform_real_distribution<float> dist(-2.0f, 2.0f);
+        for (auto& f : v)
+            f = dist(rng);
+        return v;
+    }
+
+    // Bundle holding TWO SoaBundles (one for m, one for v) plus the public
+    // MomentsSoaViews struct that the kernels consume.
+    struct MomentsSoaBundle {
+        SoaBundle m_bundle;
+        SoaBundle v_bundle;
+        MomentsSoaViews views{};
+
+        MomentsSoaBundle(std::size_t n, std::size_t shN_floats)
+            : m_bundle(n, shN_floats),
+              v_bundle(n, shN_floats) {
+            views.m = m_bundle.views;
+            views.v = v_bundle.views;
+        }
+    };
+
+    TEST_F(AosSoaRepackTest, MomentsAosToSoaScattersMAndVCorrectly) {
+        constexpr std::size_t kN = 1024;
+        constexpr std::size_t kShN = 45;
+
+        DevBuf aos(kN * kAosMomentsFloatsPerGaussian);
+        const auto host_aos = make_moments_aos_pattern(kN, 0xA05A4D11u);
+        aos.upload(host_aos);
+
+        MomentsSoaBundle soa(kN, kShN);
+        ASSERT_EQ(lfs::training::tide::moments_aos_to_soa(aos.ptr, soa.views, nullptr), 0);
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+        const auto h_m_means = soa.m_bundle.means.download();
+        const auto h_m_scaling = soa.m_bundle.scaling.download();
+        const auto h_m_rotation = soa.m_bundle.rotation.download();
+        const auto h_m_opacity = soa.m_bundle.opacity.download();
+        const auto h_m_sh0 = soa.m_bundle.sh0.download();
+        const auto h_m_shN = soa.m_bundle.shN.download();
+
+        const auto h_v_means = soa.v_bundle.means.download();
+        const auto h_v_scaling = soa.v_bundle.scaling.download();
+        const auto h_v_rotation = soa.v_bundle.rotation.download();
+        const auto h_v_opacity = soa.v_bundle.opacity.download();
+        const auto h_v_sh0 = soa.v_bundle.sh0.download();
+        const auto h_v_shN = soa.v_bundle.shN.download();
+
+        for (std::size_t i = 0; i < kN; ++i) {
+            const float* slot = &host_aos[i * kAosMomentsFloatsPerGaussian];
+            const float* m_g = slot + kAosMomentsOffsetM;
+            const float* v_g = slot + kAosMomentsOffsetV;
+
+            for (std::size_t k = 0; k < 3; ++k) {
+                EXPECT_FLOAT_EQ(h_m_means[i * 3 + k], m_g[kAosOffsetMeans + k])    << "m.means @ i=" << i << " k=" << k;
+                EXPECT_FLOAT_EQ(h_v_means[i * 3 + k], v_g[kAosOffsetMeans + k])    << "v.means @ i=" << i << " k=" << k;
+                EXPECT_FLOAT_EQ(h_m_scaling[i * 3 + k], m_g[kAosOffsetScaling + k]) << "m.scaling @ i=" << i << " k=" << k;
+                EXPECT_FLOAT_EQ(h_v_scaling[i * 3 + k], v_g[kAosOffsetScaling + k]) << "v.scaling @ i=" << i << " k=" << k;
+                EXPECT_FLOAT_EQ(h_m_sh0[i * 3 + k], m_g[kAosOffsetSh0 + k])         << "m.sh0 @ i=" << i << " k=" << k;
+                EXPECT_FLOAT_EQ(h_v_sh0[i * 3 + k], v_g[kAosOffsetSh0 + k])         << "v.sh0 @ i=" << i << " k=" << k;
+            }
+            for (std::size_t k = 0; k < 4; ++k) {
+                EXPECT_FLOAT_EQ(h_m_rotation[i * 4 + k], m_g[kAosOffsetRotation + k]) << "m.rotation @ i=" << i << " k=" << k;
+                EXPECT_FLOAT_EQ(h_v_rotation[i * 4 + k], v_g[kAosOffsetRotation + k]) << "v.rotation @ i=" << i << " k=" << k;
+            }
+            EXPECT_FLOAT_EQ(h_m_opacity[i], m_g[kAosOffsetOpacity]) << "m.opacity @ i=" << i;
+            EXPECT_FLOAT_EQ(h_v_opacity[i], v_g[kAosOffsetOpacity]) << "v.opacity @ i=" << i;
+            for (std::size_t k = 0; k < kShN; ++k) {
+                EXPECT_FLOAT_EQ(h_m_shN[i * kShN + k], m_g[kAosOffsetShN + k]) << "m.shN @ i=" << i << " k=" << k;
+                EXPECT_FLOAT_EQ(h_v_shN[i * kShN + k], v_g[kAosOffsetShN + k]) << "v.shN @ i=" << i << " k=" << k;
+            }
+        }
+    }
+
+    TEST_F(AosSoaRepackTest, MomentsRoundTripIsBitwiseIdentityForSh3) {
+        constexpr std::size_t kN = 2048;
+        constexpr std::size_t kShN = 45;
+
+        DevBuf aos_src(kN * kAosMomentsFloatsPerGaussian);
+        DevBuf aos_dst(kN * kAosMomentsFloatsPerGaussian);
+        const auto host_aos = make_moments_aos_pattern(kN, 0xBEEF4D11u);
+        aos_src.upload(host_aos);
+        aos_dst.zero();
+
+        MomentsSoaBundle soa(kN, kShN);
+        ASSERT_EQ(lfs::training::tide::moments_aos_to_soa(aos_src.ptr, soa.views, nullptr), 0);
+        ASSERT_EQ(lfs::training::tide::moments_soa_to_aos(soa.views, aos_dst.ptr, nullptr), 0);
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+        const auto h_dst = aos_dst.download();
+        ASSERT_EQ(h_dst.size(), host_aos.size());
+        for (std::size_t i = 0; i < host_aos.size(); ++i) {
+            EXPECT_FLOAT_EQ(h_dst[i], host_aos[i]) << "moments round-trip mismatch @ idx=" << i;
+        }
+    }
+
+    TEST_F(AosSoaRepackTest, MomentsLowerShDegreesZeroPadBothTails) {
+        // SH degree 1 → shN_floats = 9. The trailing 36 rest floats inside
+        // BOTH the m and v sub-blocks must be zeroed on pack.
+        constexpr std::size_t kN = 64;
+        constexpr std::size_t kShN = 9;
+
+        DevBuf aos_src(kN * kAosMomentsFloatsPerGaussian);
+        DevBuf aos_dst(kN * kAosMomentsFloatsPerGaussian);
+        auto host_aos = make_moments_aos_pattern(kN, 0x12344D11u);
+        // Distinctive tail values inside both m and v rest regions.
+        for (std::size_t i = 0; i < kN; ++i) {
+            for (std::size_t k = 0; k < kAosShNMaxFloats; ++k) {
+                host_aos[i * kAosMomentsFloatsPerGaussian + kAosMomentsOffsetM + kAosOffsetShN + k] =
+                    100.0f + static_cast<float>(k);
+                host_aos[i * kAosMomentsFloatsPerGaussian + kAosMomentsOffsetV + kAosOffsetShN + k] =
+                    200.0f + static_cast<float>(k);
+            }
+        }
+        aos_src.upload(host_aos);
+        aos_dst.zero();
+
+        MomentsSoaBundle soa(kN, kShN);
+        ASSERT_EQ(lfs::training::tide::moments_aos_to_soa(aos_src.ptr, soa.views, nullptr), 0);
+        ASSERT_EQ(lfs::training::tide::moments_soa_to_aos(soa.views, aos_dst.ptr, nullptr), 0);
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+        const auto h_dst = aos_dst.download();
+        for (std::size_t i = 0; i < kN; ++i) {
+            const std::size_t slot = i * kAosMomentsFloatsPerGaussian;
+            // First kShN preserved in both m and v.
+            for (std::size_t k = 0; k < kShN; ++k) {
+                EXPECT_FLOAT_EQ(h_dst[slot + kAosMomentsOffsetM + kAosOffsetShN + k],
+                                100.0f + static_cast<float>(k))
+                    << "m rest preserved @ i=" << i << " k=" << k;
+                EXPECT_FLOAT_EQ(h_dst[slot + kAosMomentsOffsetV + kAosOffsetShN + k],
+                                200.0f + static_cast<float>(k))
+                    << "v rest preserved @ i=" << i << " k=" << k;
+            }
+            // Tail zeroed in both m and v.
+            for (std::size_t k = kShN; k < kAosShNMaxFloats; ++k) {
+                EXPECT_FLOAT_EQ(h_dst[slot + kAosMomentsOffsetM + kAosOffsetShN + k], 0.0f)
+                    << "m tail zeroed @ i=" << i << " k=" << k;
+                EXPECT_FLOAT_EQ(h_dst[slot + kAosMomentsOffsetV + kAosOffsetShN + k], 0.0f)
+                    << "v tail zeroed @ i=" << i << " k=" << k;
+            }
+            // Non-shN attrs in both m and v must round-trip exactly.
+            for (std::size_t k = 0; k < kAosOffsetShN; ++k) {
+                EXPECT_FLOAT_EQ(h_dst[slot + kAosMomentsOffsetM + k],
+                                host_aos[slot + kAosMomentsOffsetM + k])
+                    << "m non-shN attr @ i=" << i << " k=" << k;
+                EXPECT_FLOAT_EQ(h_dst[slot + kAosMomentsOffsetV + k],
+                                host_aos[slot + kAosMomentsOffsetV + k])
+                    << "v non-shN attr @ i=" << i << " k=" << k;
+            }
+        }
+    }
+
+    TEST_F(AosSoaRepackTest, MomentsZeroGaussiansIsNoop) {
+        MomentsSoaBundle soa(0, 0);
+        EXPECT_EQ(lfs::training::tide::moments_aos_to_soa(nullptr, soa.views, nullptr), 0);
+        EXPECT_EQ(lfs::training::tide::moments_soa_to_aos(soa.views, nullptr, nullptr), 0);
+    }
+
+    TEST_F(AosSoaRepackTest, MomentsRejectsInvalidInputs) {
+        MomentsSoaBundle soa(16, 45);
+        // Null AOS buffer.
+        EXPECT_NE(lfs::training::tide::moments_aos_to_soa(nullptr, soa.views, nullptr), 0);
+        EXPECT_NE(lfs::training::tide::moments_soa_to_aos(soa.views, nullptr, nullptr), 0);
+
+        DevBuf aos(16 * kAosMomentsFloatsPerGaussian);
+        aos.zero();
+
+        // Mismatched num_gaussians between m and v.
+        MomentsSoaViews bad_n = soa.views;
+        bad_n.v.num_gaussians = 8;
+        EXPECT_NE(lfs::training::tide::moments_aos_to_soa(aos.ptr, bad_n, nullptr), 0);
+        EXPECT_NE(lfs::training::tide::moments_soa_to_aos(bad_n, aos.ptr, nullptr), 0);
+
+        // Mismatched shN_floats_per_gaussian between m and v.
+        MomentsSoaViews bad_shN = soa.views;
+        bad_shN.v.shN_floats_per_gaussian = 9;
+        EXPECT_NE(lfs::training::tide::moments_aos_to_soa(aos.ptr, bad_shN, nullptr), 0);
+        EXPECT_NE(lfs::training::tide::moments_soa_to_aos(bad_shN, aos.ptr, nullptr), 0);
+
+        // Missing required pointer in m.
+        MomentsSoaViews bad_m = soa.views;
+        bad_m.m.means_ptr = nullptr;
+        EXPECT_NE(lfs::training::tide::moments_aos_to_soa(aos.ptr, bad_m, nullptr), 0);
+
+        // Missing required pointer in v.
+        MomentsSoaViews bad_v = soa.views;
+        bad_v.v.opacity_ptr = nullptr;
+        EXPECT_NE(lfs::training::tide::moments_aos_to_soa(aos.ptr, bad_v, nullptr), 0);
+
+        // Out-of-range shN width.
+        MomentsSoaViews too_wide = soa.views;
+        too_wide.m.shN_floats_per_gaussian = kAosShNMaxFloats + 1;
+        too_wide.v.shN_floats_per_gaussian = kAosShNMaxFloats + 1;
+        EXPECT_NE(lfs::training::tide::moments_aos_to_soa(aos.ptr, too_wide, nullptr), 0);
+        EXPECT_NE(lfs::training::tide::moments_soa_to_aos(too_wide, aos.ptr, nullptr), 0);
+    }
+
+    TEST_F(AosSoaRepackTest, MomentsShDegreeZeroSkipsShNAndZerosBothTails) {
+        constexpr std::size_t kN = 128;
+
+        DevBuf aos_src(kN * kAosMomentsFloatsPerGaussian);
+        DevBuf aos_dst(kN * kAosMomentsFloatsPerGaussian);
+        auto host_aos = make_moments_aos_pattern(kN, 0xCAFE4D11u);
+        for (std::size_t i = 0; i < kN; ++i) {
+            for (std::size_t k = 0; k < kAosShNMaxFloats; ++k) {
+                host_aos[i * kAosMomentsFloatsPerGaussian + kAosMomentsOffsetM + kAosOffsetShN + k] =
+                    -7.0f - static_cast<float>(k);
+                host_aos[i * kAosMomentsFloatsPerGaussian + kAosMomentsOffsetV + kAosOffsetShN + k] =
+                    -17.0f - static_cast<float>(k);
+            }
+        }
+        aos_src.upload(host_aos);
+        aos_dst.zero();
+
+        MomentsSoaBundle soa(kN, 0);
+        ASSERT_EQ(soa.views.m.shN_ptr, nullptr);
+        ASSERT_EQ(soa.views.v.shN_ptr, nullptr);
+        ASSERT_EQ(lfs::training::tide::moments_aos_to_soa(aos_src.ptr, soa.views, nullptr), 0);
+        ASSERT_EQ(lfs::training::tide::moments_soa_to_aos(soa.views, aos_dst.ptr, nullptr), 0);
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+        const auto h_dst = aos_dst.download();
+        for (std::size_t i = 0; i < kN; ++i) {
+            const std::size_t slot = i * kAosMomentsFloatsPerGaussian;
+            // Non-shN attrs round-trip in both halves.
+            for (std::size_t k = 0; k < kAosOffsetShN; ++k) {
+                EXPECT_FLOAT_EQ(h_dst[slot + kAosMomentsOffsetM + k],
+                                host_aos[slot + kAosMomentsOffsetM + k])
+                    << "m attr @ i=" << i << " k=" << k;
+                EXPECT_FLOAT_EQ(h_dst[slot + kAosMomentsOffsetV + k],
+                                host_aos[slot + kAosMomentsOffsetV + k])
+                    << "v attr @ i=" << i << " k=" << k;
+            }
+            // Entire rest region zeroed in both halves.
+            for (std::size_t k = 0; k < kAosShNMaxFloats; ++k) {
+                EXPECT_FLOAT_EQ(h_dst[slot + kAosMomentsOffsetM + kAosOffsetShN + k], 0.0f);
+                EXPECT_FLOAT_EQ(h_dst[slot + kAosMomentsOffsetV + kAosOffsetShN + k], 0.0f);
+            }
+        }
+    }
+
+    TEST_F(AosSoaRepackTest, MomentsRunsOnCustomStream) {
+        constexpr std::size_t kN = 256;
+        constexpr std::size_t kShN = 45;
+
+        cudaStream_t stream = nullptr;
+        ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+
+        DevBuf aos(kN * kAosMomentsFloatsPerGaussian);
+        const auto host_aos = make_moments_aos_pattern(kN, 0x57234D11u);
+        aos.upload(host_aos);
+
+        MomentsSoaBundle soa(kN, kShN);
+        EXPECT_EQ(lfs::training::tide::moments_aos_to_soa(aos.ptr, soa.views, stream), 0);
+        EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+        const auto h_m_means = soa.m_bundle.means.download();
+        const auto h_v_opacity = soa.v_bundle.opacity.download();
+        for (std::size_t i = 0; i < kN; ++i) {
+            const std::size_t slot = i * kAosMomentsFloatsPerGaussian;
+            for (std::size_t k = 0; k < 3; ++k) {
+                EXPECT_FLOAT_EQ(h_m_means[i * 3 + k],
+                                host_aos[slot + kAosMomentsOffsetM + kAosOffsetMeans + k]);
+            }
+            EXPECT_FLOAT_EQ(h_v_opacity[i],
+                            host_aos[slot + kAosMomentsOffsetV + kAosOffsetOpacity]);
+        }
+        EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+    }
+
 } // namespace
