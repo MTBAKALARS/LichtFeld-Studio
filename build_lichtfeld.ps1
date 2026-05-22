@@ -695,28 +695,44 @@ function Build-LichtFeldStudio {
             Write-Host ""
         }
 
-        # Always use Visual Studio generator on Windows for better compatibility
-        $Generator = "Visual Studio 17 2022"
+        # Use Ninja on Windows: it bypasses MSBuild's CUDA build-customization layer
+        # (CudaBuildCore + tmp.cmd) which silently corrupts nvcc invocations even after
+        # -ccbin and PATH are correctly pinned. See repo memory lichtfeld_build_cuda_pinning.md.
+        $Generator = "Ninja"
 
-        # Verify Visual Studio generator is available (only if cl.exe wasn't found earlier)
-        # If we're in a VS dev environment with working cl.exe, the generator should work
-        if (-not (Test-Command "cl")) {
-            $VSInstallPath = Find-VSInstallPath
-            if (-not $VSInstallPath) {
-                Write-Host "ERROR: Visual Studio 2022 not found!" -ForegroundColor Red
-                Write-Host "The '$Generator' generator requires Visual Studio 2022 to be installed." -ForegroundColor Gray
-                Write-Host ""
-                Write-Host "Please install Visual Studio 2022 with 'Desktop development with C++' workload" -ForegroundColor Yellow
-                Write-Host "Download from: https://visualstudio.microsoft.com/downloads/" -ForegroundColor Cyan
+        # Verify ninja is available; check PATH first, then VS bundled location.
+        $NinjaCmd = Get-Command ninja -ErrorAction SilentlyContinue
+        if (-not $NinjaCmd) {
+            $VsNinja = 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe'
+            if (Test-Path $VsNinja) {
+                $env:PATH = (Split-Path $VsNinja) + ';' + $env:PATH
+                Write-Host "  Using VS-bundled ninja: $VsNinja" -ForegroundColor Gray
+            } else {
+                Write-Host "ERROR: ninja not found in PATH or VS bundled location." -ForegroundColor Red
                 exit 1
             }
         }
 
+        # Verify cl.exe is on PATH (must be from the right VsDevShell already).
+        if (-not (Test-Command "cl")) {
+            Write-Host "ERROR: cl.exe not in PATH. Launch via _tide_build_launch.ps1 (VsDevShell amd64)." -ForegroundColor Red
+            exit 1
+        }
+
         # Build CMake arguments
+        # Ninja is single-config: pass CMAKE_BUILD_TYPE.
+        # MSVC version is pinned via Directory.Build.props and the v143.default.txt edit
+        # so the dev-shell-resolved cl.exe is 14.44.
+        # CUDA toolkit is pinned via CUDA_PATH / CUDACXX env vars (set in _tide_build_launch.ps1).
         $CMakeArgs = @(
             "-B", "build",
             "-G", $Generator,
-            "-A", "x64",
+            "-DCMAKE_BUILD_TYPE=$Configuration",
+            # CMake's CUDA compiler-ID probe defaults to compute_52/sm_52, which CUDA 12.9
+            # warns is deprecated and the -G (device debug) probe-compile rejects. Pin
+            # the architecture to 89 (RTX 4090 Ada) so the probe and all device code
+            # target a supported arch.
+            "-DCMAKE_CUDA_ARCHITECTURES=89",
             "-DCMAKE_TOOLCHAIN_FILE=$VcpkgToolchain"
         )
 
@@ -755,9 +771,8 @@ function Build-LichtFeldStudio {
         Write-Host "This may take 10-30 minutes depending on your system..." -ForegroundColor Gray
         Write-Host ""
 
-        # Use msbuild for better Windows compatibility
-        $SolutionFile = Join-Path $BuildDir "LichtFeld-Studio.sln"
-        msbuild $SolutionFile /p:Configuration=$Configuration /p:Platform=x64 /m
+        # Ninja: invoke via cmake --build (single-config, parallel by default).
+        & cmake --build build --config $Configuration --parallel
 
         if ($LASTEXITCODE -ne 0) {
             Write-Host "ERROR: Build failed!" -ForegroundColor Red
