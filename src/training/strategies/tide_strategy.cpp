@@ -422,6 +422,45 @@ namespace lfs::training {
                     throw std::runtime_error(cuda_err("cudaMemset(soa zero)", err));
                 }
             }
+
+            // Phase 3.5.8c VRAM-FIX: release placeholder PLY's GPU tensors.
+            // In the WorkingSet-attached path the SOA scratch is bootstrapped
+            // by zero-fill (above), and pre_step's aos_to_soa pulls the real
+            // data from the WorkingSet's per-slot buffers on first iteration.
+            // The placeholder SplatData loaded from PLY (~1.66 GiB GPU for
+            // 6.95M Gaussians SH-3) is dead weight from here on: TideStrategy
+            // exposes its view-backed SplatData (from_blob over d_*) instead.
+            // Freeing the placeholder tensors recovers the VRAM that the
+            // rasterizer arena (512 MB) and per-step grad/scratch need.
+            if (impl_->placeholder != nullptr) {
+                size_t free_before = 0, total_b = 0;
+                cudaMemGetInfo(&free_before, &total_b);
+                impl_->placeholder->means_raw()    = lfs::core::Tensor();
+                impl_->placeholder->scaling_raw()  = lfs::core::Tensor();
+                impl_->placeholder->rotation_raw() = lfs::core::Tensor();
+                impl_->placeholder->opacity_raw()  = lfs::core::Tensor();
+                impl_->placeholder->sh0_raw()      = lfs::core::Tensor();
+                impl_->placeholder->shN_raw()      = lfs::core::Tensor();
+                cudaDeviceSynchronize();
+                // Phase 3.5.8e: do NOT trim_cached_memory() here. Although
+                // trim makes the freed bytes visible to cudaMemGetInfo, it
+                // forces downstream allocations (gradient buffers, Adam
+                // state in the optimizer) to cudaMalloc fresh which causes
+                // fragmentation and ends up costing more VRAM than is saved.
+                // The placeholder bytes go back to the size-bucketed pool
+                // cache, where they are reused by subsequent identically-
+                // sized requests. Net VRAM use is the same.
+                size_t free_after = 0;
+                cudaMemGetInfo(&free_after, &total_b);
+                const long long delta_mib = (static_cast<long long>(free_after) -
+                                             static_cast<long long>(free_before)) /
+                                            (1024 * 1024);
+                LOG_INFO("TideStrategy: released placeholder PLY GPU tensors "
+                         "(pool-visible freed {} MiB; free {} -> {} MiB)",
+                         delta_mib,
+                         free_before / (1024u * 1024u),
+                         free_after / (1024u * 1024u));
+            }
         } else {
             auto copy_from_placeholder = [n](float* dst, const Tensor& src, std::size_t expected_floats, const char* name) {
                 if (!src.is_valid() || src.numel() == 0) {
@@ -495,25 +534,59 @@ namespace lfs::training {
         // Standard Adam over the view (Phase 3.2b: drives both grads and
         // state; Phase 3.3 will retain only the grad buffers and step via
         // TideResidentAdam).
-        impl_->optimizer = create_optimizer(*impl_->splat_view, *impl_->params);
+        //
+        // Phase 3.5.8b VRAM fix: in v2 path (moments_enabled), the view-
+        // backed AdamOptimizer's step() is never called — the trainer drives
+        // step_external_moments on the per-block WorkingSet moments slot.
+        // create_optimizer would pre-allocate m/v buffers sized for
+        // params.max_cap (typ. 5M) — ~2.3 GB of dead VRAM. Override to 0 so
+        // Adam state is allocated lazily on first step() (which never fires
+        // in v2). Gradient buffers (allocate_gradients) are still allocated
+        // because the rasterizer writes them and step_external_moments reads
+        // them.
+        if (moments_enabled) {
+            auto opt_params_no_prealloc = *impl_->params;
+            opt_params_no_prealloc.max_cap = 0;
+            impl_->optimizer = create_optimizer(*impl_->splat_view, opt_params_no_prealloc);
+            LOG_INFO("TideStrategy: view-backed AdamOptimizer state pre-allocation SKIPPED (v2 path bypasses optimizer->step); only gradient buffers allocated");
+        } else {
+            impl_->optimizer = create_optimizer(*impl_->splat_view, *impl_->params);
+        }
         impl_->optimizer->allocate_gradients(n);
         impl_->scheduler = create_scheduler(*impl_->params, *impl_->optimizer);
 
         // Phase 3.1 resident Adam, sharing the same per-ParamType element
         // counts. Reused config keeps LR/beta/eps numerically identical.
+        //
+        // Phase 3.5.8b VRAM fix: in v2 path (moments_enabled), each block's
+        // m/v live in the WorkingSet moments slot and step_external_moments
+        // is called with EXTERNAL pointers — TideResidentAdam's internal
+        // exp_avg/exp_avg_sq buffers are never read or written. Allocating
+        // them costs ~3 GB for a 6.55M-Gaussian SH-3 model (ShN alone is
+        // 2.36 GB), pushing us past the 24 GB physical limit. Pass
+        // num_elements=0 to skip the cudaMalloc while keeping the ParamSpec
+        // registered (state.allocated=true), which step_external_moments
+        // requires. Legacy v1 path (no moments) keeps the original sizing.
         const auto& adam_cfg = impl_->optimizer->get_config();
         tide::TideResidentAdam::Config tide_cfg;
         tide_cfg.adam = adam_cfg;
         tide_cfg.cuda_device = 0;
         tide_cfg.sh_warmup_iterations = 1000;
 
+        const std::size_t means_n    = moments_enabled ? 0u : n * 3;
+        const std::size_t sh0_n      = moments_enabled ? 0u : n * 3;
+        const std::size_t shN_n      = moments_enabled ? 0u : n * impl_->shN_floats;
+        const std::size_t scaling_n  = moments_enabled ? 0u : n * 3;
+        const std::size_t rotation_n = moments_enabled ? 0u : n * 4;
+        const std::size_t opacity_n  = moments_enabled ? 0u : n * 1;
+
         const std::array<tide::TideResidentAdam::ParamSpec, 6> specs{{
-            {ParamType::Means,     n * 3},
-            {ParamType::Sh0,       n * 3},
-            {ParamType::ShN,       n * impl_->shN_floats},
-            {ParamType::Scaling,   n * 3},
-            {ParamType::Rotation,  n * 4},
-            {ParamType::Opacity,   n * 1},
+            {ParamType::Means,     means_n},
+            {ParamType::Sh0,       sh0_n},
+            {ParamType::ShN,       shN_n},
+            {ParamType::Scaling,   scaling_n},
+            {ParamType::Rotation,  rotation_n},
+            {ParamType::Opacity,   opacity_n},
         }};
         auto resident = tide::TideResidentAdam::create(
             tide_cfg, std::span<const tide::TideResidentAdam::ParamSpec>(specs));
@@ -521,6 +594,13 @@ namespace lfs::training {
             throw std::runtime_error("TideStrategy::initialize: TideResidentAdam::create failed: " + resident.error());
         }
         impl_->resident_adam = std::move(*resident);
+
+        if (moments_enabled) {
+            const std::size_t would_have_alloc_floats =
+                n * (3u /*means*/ + 3u /*sh0*/ + impl_->shN_floats + 3u /*scaling*/ + 4u /*rotation*/ + 1u /*opacity*/);
+            LOG_INFO("TideStrategy: TideResidentAdam internal m/v allocations SKIPPED (v2 path uses WorkingSet moments slot via step_external_moments); saved ~{} MiB",
+                     (would_have_alloc_floats * 2u * sizeof(float)) / (1024u * 1024u));
+        }
 
         LOG_INFO("TideStrategy initialized: {} Gaussians, SH degree {}, view-backed SplatData, working_set={}",
                  n, impl_->sh_degree, impl_->working_set ? "attached" : "none");
