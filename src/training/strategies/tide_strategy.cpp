@@ -807,17 +807,28 @@ namespace lfs::training {
         out_resident.clear();
         out_resident.reserve(capacity);
 
+        // Phase 3.5.8q VRAM-FIX: when visible > capacity, truncate the
+        // visible list to capacity instead of throwing. The dropped blocks
+        // are not rendered this iteration but they persist in the store and
+        // will be selected by frustum culling in later iterations. This is
+        // a graceful degradation that lets training proceed on tight VRAM
+        // budgets where Tide capacity is set conservatively. Frustum culling
+        // already preserves a natural priority ordering (closer / more
+        // central blocks first in some sense) so the head of `out_visible`
+        // is a reasonable choice.
+        if (out_visible.size() > capacity) {
+            LOG_WARN("TideStrategy::pre_forward: visible set size {} exceeds "
+                     "WorkingSet capacity {} at iter {}; truncating to capacity "
+                     "(dropped {} blocks this iteration). To eliminate these "
+                     "drops, increase --tide-capacity-blocks.",
+                     out_visible.size(), capacity, iter,
+                     out_visible.size() - capacity);
+            out_visible.resize(capacity);
+        }
+
         std::unordered_set<std::size_t> visible_set(
             out_visible.begin(), out_visible.end());
 
-        if (visible_set.size() > capacity) {
-            throw std::runtime_error(
-                "TideStrategy::pre_forward: visible set size " +
-                std::to_string(visible_set.size()) +
-                " exceeds WorkingSet capacity " + std::to_string(capacity) +
-                " at iter " + std::to_string(iter) +
-                " - increase --tide-capacity-blocks");
-        }
         for (auto vid : out_visible) {
             out_resident.push_back(vid);
         }
