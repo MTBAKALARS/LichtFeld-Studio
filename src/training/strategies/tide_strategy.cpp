@@ -432,15 +432,41 @@ namespace lfs::training {
             // exposes its view-backed SplatData (from_blob over d_*) instead.
             // Freeing the placeholder tensors recovers the VRAM that the
             // rasterizer arena (512 MB) and per-step grad/scratch need.
+            //
+            // Phase 3.5.8w live-GUI-render bridge: instead of clearing the
+            // placeholder tensors to invalid (which would leave the visualizer
+            // staring at `_means.is_valid() == false` for the entire training
+            // run), reassign each placeholder tensor to a NON-OWNING
+            // `Tensor::from_blob` view of the matching d_* SOA scratch buffer.
+            // The reassignment destructs the old owning PLY tensor in place
+            // (freeing the ~1.66 GiB GPU memory as before), then alias-installs
+            // a zero-cost handle that lets `Scene::getTrainingModel()` →
+            // viewer renderer read the live training state. The shape is
+            // initialized to `{0, ...}` so the renderer sees "no data yet"
+            // until the first `unpack_active_data_to_soa_()` call publishes
+            // an `active_n > 0` view via `update_render_view_`.
             if (impl_->placeholder != nullptr) {
                 size_t free_before = 0, total_b = 0;
                 cudaMemGetInfo(&free_before, &total_b);
-                impl_->placeholder->means_raw()    = lfs::core::Tensor();
-                impl_->placeholder->scaling_raw()  = lfs::core::Tensor();
-                impl_->placeholder->rotation_raw() = lfs::core::Tensor();
-                impl_->placeholder->opacity_raw()  = lfs::core::Tensor();
-                impl_->placeholder->sh0_raw()      = lfs::core::Tensor();
-                impl_->placeholder->shN_raw()      = lfs::core::Tensor();
+                impl_->placeholder->means_raw()    = lfs::core::Tensor::from_blob(
+                    impl_->d_means,    TensorShape({0, 3}), Device::CUDA, DataType::Float32);
+                impl_->placeholder->scaling_raw()  = lfs::core::Tensor::from_blob(
+                    impl_->d_scaling,  TensorShape({0, 3}), Device::CUDA, DataType::Float32);
+                impl_->placeholder->rotation_raw() = lfs::core::Tensor::from_blob(
+                    impl_->d_rotation, TensorShape({0, 4}), Device::CUDA, DataType::Float32);
+                impl_->placeholder->opacity_raw()  = lfs::core::Tensor::from_blob(
+                    impl_->d_opacity,  TensorShape({0, 1}), Device::CUDA, DataType::Float32);
+                impl_->placeholder->sh0_raw()      = lfs::core::Tensor::from_blob(
+                    impl_->d_sh0,      TensorShape({0, 1, 3}), Device::CUDA, DataType::Float32);
+                // shN may be absent (sh_degree == 0); use an empty view-backed
+                // tensor of the canonical shape so callers don't NPE on shape().
+                const std::size_t sh_rest_components =
+                    (impl_->shN_floats == 0) ? 0u : (impl_->shN_floats / 3);
+                impl_->placeholder->shN_raw() = (impl_->d_shN == nullptr)
+                    ? lfs::core::Tensor::zeros({0, 0, 3}, Device::CUDA)
+                    : lfs::core::Tensor::from_blob(impl_->d_shN,
+                          TensorShape({0, sh_rest_components, 3}),
+                          Device::CUDA, DataType::Float32);
                 cudaDeviceSynchronize();
                 // Phase 3.5.8e: do NOT trim_cached_memory() here. Although
                 // trim makes the freed bytes visible to cudaMemGetInfo, it
@@ -859,6 +885,44 @@ namespace lfs::training {
         std::sort(out_resident.begin(), out_resident.end());
     }
 
+    void TideStrategy::update_render_view_(std::size_t active_n) {
+        // Phase 3.5.8w live-GUI render bridge — see header doc on
+        // update_render_view_ for the rationale. We reassign the placeholder
+        // SplatData's tensors to non-owning views over the SOA scratch
+        // buffers with shape `{active_n, ...}`. Per-frame this is just six
+        // CPU-side Tensor handle swaps (a few `std::shared_ptr`-cheap
+        // operations) — no GPU work, no allocations, no copies. The
+        // visualizer's `hasRenderableGaussians` gate then sees
+        // `_means.is_valid() == true && size() == active_n`, and the
+        // rasterizer reads the live training state from the same d_*
+        // buffers the trainer is updating.
+        using namespace lfs::core;
+        if (impl_->placeholder == nullptr) {
+            return;
+        }
+        // Clamp to the SOA capacity to defend against caller bugs; the
+        // unpack path already clamps via std::min(active_n, soa_capacity).
+        const std::size_t n = std::min(active_n, impl_->soa_capacity);
+        const std::size_t sh_rest_components =
+            (impl_->shN_floats == 0) ? 0u : (impl_->shN_floats / 3);
+
+        impl_->placeholder->means_raw() = Tensor::from_blob(
+            impl_->d_means, TensorShape({n, 3}), Device::CUDA, DataType::Float32);
+        impl_->placeholder->scaling_raw() = Tensor::from_blob(
+            impl_->d_scaling, TensorShape({n, 3}), Device::CUDA, DataType::Float32);
+        impl_->placeholder->rotation_raw() = Tensor::from_blob(
+            impl_->d_rotation, TensorShape({n, 4}), Device::CUDA, DataType::Float32);
+        impl_->placeholder->opacity_raw() = Tensor::from_blob(
+            impl_->d_opacity, TensorShape({n, 1}), Device::CUDA, DataType::Float32);
+        impl_->placeholder->sh0_raw() = Tensor::from_blob(
+            impl_->d_sh0, TensorShape({n, 1, 3}), Device::CUDA, DataType::Float32);
+        impl_->placeholder->shN_raw() = (impl_->d_shN == nullptr)
+            ? Tensor::zeros({n, 0, 3}, Device::CUDA)
+            : Tensor::from_blob(impl_->d_shN,
+                                TensorShape({n, sh_rest_components, 3}),
+                                Device::CUDA, DataType::Float32);
+    }
+
     void TideStrategy::unpack_active_data_to_soa_() {
         // Phase 3.5.7 fix: data-only AOS→SOA unpack so the rendering
         // SplatData view sees real Gaussians before fast_rasterize_forward
@@ -892,6 +956,10 @@ namespace lfs::training {
                     "TideStrategy::unpack_active_data_to_soa_: aos_to_soa launch failed: " +
                     std::string(cudaGetErrorString(static_cast<cudaError_t>(rc))));
             }
+            // Phase 3.5.8w: publish the freshly unpacked active range to the
+            // viewer-facing placeholder so Scene::getTrainingModel() renders
+            // the live training state.
+            update_render_view_(n);
             return;
         }
 
@@ -918,6 +986,13 @@ namespace lfs::training {
                     std::string(cudaGetErrorString(static_cast<cudaError_t>(rc))));
             }
         }
+        // Phase 3.5.8w: publish the freshly unpacked active range to the
+        // viewer-facing placeholder so Scene::getTrainingModel() renders the
+        // live training state. NOTE: for Mode C (LRU eviction over capacity)
+        // the active slots are sparse and `{active_n, ...}` is a contiguous
+        // approximation — accurate for Mode A and Mode B (the only paths
+        // exercised today) and a known limitation otherwise.
+        update_render_view_(n);
     }
 
     void TideStrategy::pre_step(int /*iter*/, RenderOutput& /*render_output*/) {

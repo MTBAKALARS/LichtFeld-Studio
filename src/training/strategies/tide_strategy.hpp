@@ -215,6 +215,37 @@ namespace lfs::training {
         // and cheap (one kernel launch per active block).
         void unpack_active_data_to_soa_();
 
+        // Phase 3.5.8w — Live GUI render bridge.
+        //
+        // The Scene's viewer-side SplatData (the "placeholder" SplatData that
+        // was loaded from the start PLY and handed to TideStrategy at
+        // construction) is what `Scene::getTrainingModel()` returns to the
+        // visualizer renderer. After Tide takes over, the placeholder's
+        // owning tensors are released to recover VRAM. Without intervention
+        // the renderer sees `_means.is_valid() == false` and
+        // `hasRenderableGaussians` short-circuits → blank viewport.
+        //
+        // This method re-aliases the placeholder's tensors to non-owning
+        // `Tensor::from_blob` views of the current SOA scratch buffers
+        // (d_means/d_sh0/d_shN/d_scaling/d_rotation/d_opacity) with shape
+        // `{active_n, ...}`. The views share the SAME GPU memory the
+        // rasterizer/optimizer read and write each training iteration, so
+        // the visualizer sees the splat evolve live with zero copy and zero
+        // additional VRAM (views are non-owning).
+        //
+        // Thread safety: callers must hold the trainer's `render_mutex_` in
+        // exclusive mode (this is the natural invariant during pre_forward
+        // and pre_step — both run inside the trainer's training-loop unique
+        // lock, see trainer.cpp `render_mutex_` acquisitions).
+        //
+        // Caveat (Mode C, LRU eviction): for v2 stores that exceed
+        // WorkingSet capacity, active slot positions in the SOA buffers are
+        // sparse and non-contiguous; a contiguous `{active_n, ...}` view
+        // would render the wrong slots. For Mode A (v1) and Mode B (v2 fits)
+        // — which is the only path Vatican uses today — active records are
+        // contiguous from slot 0 and this aliasing is exact.
+        void update_render_view_(std::size_t active_n);
+
         struct Impl;
         std::unique_ptr<Impl> impl_;
     };

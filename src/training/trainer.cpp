@@ -1520,6 +1520,32 @@ namespace lfs::training {
                 memory_breakdown_logged_init_ = true;
             }
 
+            // Phase 3.5.8v: Pre-populate Tide WorkingSet residency before returning
+            // from initialize(). Without this, when launched with --train flag, the
+            // visualizer emits TrainingStarted (synchronous handler switches to splat
+            // mode) before the training thread gets CPU time to call pre_forward().
+            // The main thread's next render() then hits the splat rendering path with
+            // an empty WorkingSet (d_* SOA scratch is zero-initialized,
+            // tiles_processed==0, unpack reads invalid pointers) and silently exits.
+            // One synchronous pre_forward(0, cam0) populates the WorkingSet so the
+            // GUI's first splat render finds valid data. Headless mode is unaffected
+            // (no GUI render races trainer thread's first pre_forward).
+            if (tide_runtime_ && train_dataset_ && !train_dataset_->get_cameras().empty()) {
+                const auto& cam0 = train_dataset_->get_cameras()[0];
+                if (cam0) {
+                    try {
+                        LOG_INFO("Tide: pre-populating WorkingSet residency (camera 0) for GUI safety");
+                        strategy_->pre_forward(0, *cam0);
+                        LOG_INFO("Tide: WorkingSet residency pre-populated successfully");
+                    } catch (const std::exception& e) {
+                        LOG_WARN("Tide: pre-populate failed (non-fatal, will retry at iter 0): {}",
+                                 e.what());
+                    } catch (...) {
+                        LOG_WARN("Tide: pre-populate failed with unknown exception (non-fatal, will retry at iter 0)");
+                    }
+                }
+            }
+
             LOG_INFO("Trainer initialization complete");
             return {};
         } catch (const std::exception& e) {

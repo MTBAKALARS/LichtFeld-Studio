@@ -70,7 +70,19 @@ namespace lfs::core {
         int get_active_sh_degree() const { return _active_sh_degree; }
         int get_max_sh_degree() const { return _max_sh_degree; }
         float get_scene_scale() const { return _scene_scale; }
-        unsigned long size() const { return static_cast<unsigned long>(_means.shape()[0]); }
+        unsigned long size() const {
+            // Safe under Tide strategy where _means may be temporarily released
+            // while the working set is the source of truth. Returning 0 here
+            // matches the "no full dense view" semantics used by hasRenderableGaussians.
+            if (!_means.is_valid()) {
+                return 0UL;
+            }
+            const auto& s = _means.shape();
+            if (s.rank() == 0) {
+                return 0UL;
+            }
+            return static_cast<unsigned long>(s[0]);
+        }
 
         // ========== Raw tensor access (for optimization) ==========
         inline Tensor& means() { return _means; }
