@@ -12,6 +12,7 @@
 #include "control/control_boundary.hpp"
 #include "core/checkpoint_format.hpp"
 #include "core/cuda/memory_arena.hpp"
+#include <cuda_runtime.h>
 #include "core/events.hpp"
 #include "core/image_io.hpp"
 #include "core/logger.hpp"
@@ -1104,6 +1105,34 @@ namespace lfs::training {
             memory_breakdown_logged_first_batch_ = false;
             memory_breakdown_logged_first_raster_ = false;
             memory_breakdown_logged_first_step_ = false;
+
+            // Phase 3.5.8o VRAM-FIX: pre-warm the rasterizer arena BEFORE
+            // strategy_->initialize() claims the Tide WorkingSet / SOA /
+            // moments (~20 GiB at cap=1600). At this point ~24 GiB is free
+            // so the arena can claim its full 2 GiB target up front, and
+            // Tide gets the remaining ~22 GiB. The previous post-strategy
+            // pre-warm (after bg-color) ran with only 500 MB free and
+            // routinely OOM'd the backward pass.
+            //
+            // Phase 3.5.8p VRAM-FIX: get_arena() alone only constructs the
+            // RasterizerMemoryArena object — the underlying per-device VMM
+            // reservation + initial commit happen lazily in
+            // get_or_create_arena(device), which is called from the
+            // allocator lambda. To force physical commit NOW we open a
+            // frame, allocate 1 byte (triggers get_or_create_arena ->
+            // commit_more_memory(initial_commit=2GB)), then close the frame.
+            // The 2 GiB stays committed; subsequent rendering frames just
+            // reset the offset and reuse this pre-committed region.
+            try {
+                auto& arena = lfs::core::GlobalArenaManager::instance().get_arena();
+                const uint64_t prewarm_frame = arena.begin_frame(false);
+                auto allocator = arena.get_allocator(prewarm_frame);
+                (void)allocator(static_cast<size_t>(1));
+                arena.end_frame(prewarm_frame, false);
+                cudaDeviceSynchronize();
+            } catch (const std::exception& e) {
+                LOG_WARN("Rasterizer arena early pre-warm failed: {}", e.what());
+            }
 
             // Create DatasetConfig for lfs::training::CameraDataset
             lfs::training::DatasetConfig dataset_config;
