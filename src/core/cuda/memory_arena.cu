@@ -4,6 +4,7 @@
 
 #include "core/logger.hpp"
 #include "memory_arena.hpp"
+#include "core/tensor/internal/memory_pool.hpp"
 #include <algorithm>
 #include <cstring>
 #include <cuda_runtime.h>
@@ -468,18 +469,38 @@ namespace lfs::core {
                                          std::string(cudaGetErrorString(err)));
             }
 
-            // Start with a reasonable initial size
-            size_t initial_size = std::min({config_.initial_commit,
-                                            free_memory / 2,
-                                            size_t(256) << 20});
+            // Start with a reasonable initial size.
+            // Phase 3.5.8f VRAM-FIX: previously this used free/2 as a cap,
+            // which is overly conservative when the arena's caller is the
+            // training loop and explicitly wants to reserve its working
+            // buffers. Use free*3/4 instead so we can claim the arena when
+            // only ~85-100 MB is free (Tide cap=1600 + Vatican 4K case).
+            //
+            // Phase 3.5.8h VRAM-FIX: removed the hardcoded 256 MB cap. Our
+            // adapted_commit already caps at 512 MB and adapts to free/2,
+            // so capping again at 256 MB defeated the adaptation and left
+            // the arena too small to satisfy the rasterizer's first frame
+            // (~425 MB). Let initial_size grow up to config_.initial_commit
+            // (which is adapted at get_arena time).
+            size_t initial_size = std::min(config_.initial_commit,
+                                           (free_memory * 3) / 4);
 
-            if (initial_size < (64 << 20)) {
-                throw std::runtime_error("Insufficient GPU memory for arena initialization (need at least 64MB)");
+            // Phase 3.5.8f: lower floor from 64MB -> 16MB. The arena grows
+            // on demand via commit_more_memory; a 16MB seed is enough to
+            // bootstrap and let subsequent growth fill in the working set
+            // as Gaussians become visible.
+            constexpr size_t kArenaMinSeed = 16ULL << 20;
+            if (initial_size < kArenaMinSeed) {
+                throw std::runtime_error(
+                    "Insufficient GPU memory for arena initialization (need at least 16MB) "
+                    "[DIAG: free=" + std::to_string(free_memory >> 20) + " MB, total=" +
+                    std::to_string(total_memory >> 20) + " MB, initial_commit_cfg=" +
+                    std::to_string(config_.initial_commit >> 20) + " MB]");
             }
 
             // Try to allocate with fallback to smaller sizes
             bool allocated = false;
-            while (initial_size >= (64 << 20) && !allocated) {
+            while (initial_size >= kArenaMinSeed && !allocated) {
                 err = cudaMalloc(&arena.fallback_buffer, initial_size);
                 if (err == cudaSuccess) {
                     LOG_TRACE("Arena cudaMalloc: %zu MB", initial_size >> 20);
@@ -800,17 +821,13 @@ namespace lfs::core {
             // We need to grow - calculate how much
             size_t growth_needed = total_needed - arena.committed_size;
 
-            // Progressive fallback strategy
-            size_t growth_amount;
-            if (retry < 3) {
-                growth_amount = growth_needed * 2;
-                if (retry > 0) {
-                    LOG_DEBUG("Retry %d: growth %zu MB (2x needed)", retry, growth_amount >> 20);
-                }
-            } else {
-                growth_amount = (growth_needed * 3) / 2;
-                LOG_DEBUG("Retry %d: minimal growth %zu MB", retry, growth_amount >> 20);
-            }
+            // Progressive fallback strategy.
+            // Phase 3.5.8h VRAM-FIX: previous strategy was *2 for early retries
+            // and *1.5 later, which inflates a 230 MB need into 460 MB and
+            // exhausts the tight Tide budget. Use minimal growth on every
+            // retry; grow_arena's own ALIGNMENT pads to 64 MB granularity so
+            // the arena still grows smoothly without overshoot.
+            size_t growth_amount = growth_needed;
 
             // Cap at max physical
             size_t new_committed = std::min(arena.committed_size + growth_amount, config_.max_physical);
@@ -861,11 +878,16 @@ namespace lfs::core {
     bool RasterizerMemoryArena::grow_arena(Arena& arena, size_t required_size) {
         // Called with arena_mutex_ held (fallback for non-VMM systems)
         const size_t old_capacity = arena.capacity;
-        size_t new_capacity = std::max(required_size * 2, static_cast<size_t>(arena.capacity * 1.5f));
-
-        // Round up to 128MB boundary
-        constexpr size_t ALIGNMENT = 128 << 20;
+        // Phase 3.5.8h VRAM-FIX: growth strategy was max(required*2, capacity*1.5)
+        // rounded to 128MB. That doubled the arena on each grow, requiring
+        // hundreds of MB of headroom that doesn't exist on tight Tide budgets.
+        // Switch to conservative growth: just enough for the request + a
+        // 64MB cushion, rounded to 64MB granularity. The arena will grow
+        // more frequently but each step fits in the available free VRAM.
+        constexpr size_t ALIGNMENT = 64 << 20;
+        size_t new_capacity = required_size + ALIGNMENT;
         new_capacity = ((new_capacity + ALIGNMENT - 1) / ALIGNMENT) * ALIGNMENT;
+        new_capacity = std::max(new_capacity, arena.capacity + ALIGNMENT);
         new_capacity = std::min(new_capacity, config_.max_physical);
 
         if (new_capacity <= arena.capacity) {
@@ -881,7 +903,11 @@ namespace lfs::core {
         }
 
         const size_t additional_needed = new_capacity - arena.capacity;
-        constexpr size_t MIN_FREE_BUFFER = 200 << 20;
+        // Phase 3.5.8h VRAM-FIX: 200 MB MIN_FREE_BUFFER reserve was preventing
+        // any growth on tight Tide budgets where total free hovers near 100MB.
+        // Drop to 32 MB - the rasterizer is the primary VRAM consumer at this
+        // point so reserving 200 MB for "other allocators" is wasteful.
+        constexpr size_t MIN_FREE_BUFFER = 32 << 20;
 
         LOG_DEBUG("Growing arena: %zu MB -> %zu MB (need %zu MB, free %zu MB)",
                   old_capacity >> 20, new_capacity >> 20, additional_needed >> 20, free_memory >> 20);
@@ -1022,14 +1048,50 @@ namespace lfs::core {
         std::lock_guard<std::mutex> lock(init_mutex_);
 
         if (!arena_) {
+            // Phase 3.5.8g VRAM-FIX: trim the CudaMemoryPool BEFORE the
+            // arena's first cudaMemGetInfo. The Tide initialization releases
+            // the placeholder PLY tensors (~1.66 GiB) but those bytes are
+            // held in the size-bucketed pool cache and invisible to the
+            // driver. We trim here (rather than at release time) so the
+            // intervening gradient/Adam allocations can satisfy from the
+            // pool cache without fragmenting; the trim happens once, right
+            // before the rasterizer needs the freed bytes.
+            CudaMemoryPool::instance().trim_cached_memory();
+            cudaDeviceSynchronize();
+
             // Auto-detect GPU VRAM size
             size_t free_mem, total_mem;
             cudaMemGetInfo(&free_mem, &total_mem);
 
+            // Phase 3.5.8c VRAM-FIX: adapt initial_commit to available VRAM.
+            // At Tide-scale Vatican cap=1600 the rasterizer's lazy init can
+            // wake up after the image pipeline / NvCodec have committed
+            // several hundred MB, leaving 50-200 MB free. The hardcoded
+            // 512 MB initial commit then fails -> fallback uses free/2 ->
+            // below the 64 MB floor -> throws. Adapt: target up to 512 MB
+            // but cap at free/2 (leaves headroom for image decoding) and
+            // floor at 64 MB so the arena always reserves something usable.
+            //
+            // Phase 3.5.8o VRAM-FIX: raise the preferred ceiling from
+            // 512 MB -> 2048 MB. When get_arena() runs BEFORE Tide claims
+            // its ~20 GiB working set (trainer calls it at the top of
+            // initialize()) there is ~22 GiB free, so adapted_commit=512
+            // claims a tiny slice and the backward pass later has to grow
+            // into a fragmented heap. Reserving 2 GiB up front means the
+            // backward pass (~600 MB peak) never needs to grow.
+            constexpr size_t kPreferredCommit = 2048ULL << 20;
+            constexpr size_t kMinCommit = 64ULL << 20;
+            // Use free_mem * 3/4 cap (instead of /2) so we can claim a real
+            // working slice even when free is moderate (e.g. ~2-3 GiB).
+            size_t adapted_commit = std::min(kPreferredCommit, (free_mem * 3) / 4);
+            if (adapted_commit < kMinCommit) {
+                adapted_commit = kMinCommit;
+            }
+
             // Create with VMM-optimized settings
             RasterizerMemoryArena::Config config;
             config.virtual_size = 32ULL << 30; // 32GB virtual (costs nothing!)
-            config.initial_commit = 512 << 20; // 512MB initial physical (was 256MB)
+            config.initial_commit = adapted_commit;
             config.max_physical = total_mem;   // Auto-detected from GPU
             config.granularity = 2 << 20;      // 2MB chunks
             config.alignment = 256;
