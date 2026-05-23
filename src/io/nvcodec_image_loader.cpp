@@ -440,7 +440,12 @@ namespace lfs::io {
     };
 
     namespace {
-        constexpr size_t DECODER_POOL_SIZE = 8;
+        // Phase 3.5.8b VRAM fix: each NvCodec decoder allocates ~310 MB on
+        // RTX 4090 for 4K H.265 / JPEG streams. With pool=8 that's ~2.5 GB,
+        // which alone exhausts the tight VRAM budget left after Tide's
+        // working-set + moments scratch on 24 GB cards. Drop to 2 for
+        // headroom; revisit when image pipeline is in a separate VRAM tier.
+        constexpr size_t DECODER_POOL_SIZE = 2;
         constexpr int LANCZOS_KERNEL_SIZE = 2;
     } // namespace
 

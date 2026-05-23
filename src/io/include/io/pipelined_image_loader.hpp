@@ -42,7 +42,12 @@ namespace lfs::io {
         size_t jpeg_batch_size = config::DEFAULT_BATCH_SIZE;
         size_t prefetch_count = config::DEFAULT_PREFETCH_COUNT;
         size_t output_queue_size = config::DEFAULT_OUTPUT_QUEUE_SIZE;
-        size_t decoder_pool_size = config::DEFAULT_BATCH_SIZE;
+        // Phase 3.5.8b VRAM fix: each NvCodec decoder reserves ~300 MB for
+        // 4K H.265/JPEG state. Default of 8 (= 2.5 GB) was crowding out the
+        // rasterizer arena on 24 GB cards running Tide. Decouple from
+        // DEFAULT_BATCH_SIZE and default to 2 — prefetch/batch can still
+        // queue work, but only 2 decoders run in parallel.
+        size_t decoder_pool_size = 2;
         size_t io_threads = config::DEFAULT_IO_THREADS;
         size_t cold_process_threads = config::DEFAULT_COLD_THREADS;
         size_t max_cache_bytes = config::DEFAULT_MAX_CACHE_BYTES;

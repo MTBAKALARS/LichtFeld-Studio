@@ -22,7 +22,11 @@ namespace lfs::io {
     namespace {
 
         constexpr int CACHE_HASH_LENGTH = 8;
-        constexpr int DEFAULT_DECODER_POOL_SIZE = 8;
+        // Phase 3.5.8b VRAM fix: pool of 8 NvCodec decoders reserves
+        // ~2.5 GB on 4K H.265/JPEG inputs, leaving 0 free for the
+        // rasterizer arena when Tide is also resident at cap >= 1600.
+        // Default dropped to 2.
+        constexpr int DEFAULT_DECODER_POOL_SIZE = 2;
 
         std::string generate_cache_hash() {
             static constexpr char HEX_CHARS[] = "0123456789abcdef";

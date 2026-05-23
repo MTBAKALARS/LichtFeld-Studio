@@ -36,7 +36,12 @@ namespace lfs::io {
             int device_id = 0;
             int max_num_cpu_threads = 0;
             bool enable_fallback = true;
-            size_t decoder_pool_size = 8;
+            // Phase 3.5.8b VRAM fix: each decoder reserves ~300 MB for 4K
+            // H.265/JPEG state. Default of 8 (= 2.5 GB) crowded out the
+            // rasterizer arena on 24 GB cards running Tide at cap >= 1600.
+            // Dropped to 2; bump back up when image pipeline moves to a
+            // separate VRAM tier or NvCodec gets pool sharing.
+            size_t decoder_pool_size = 2;
         };
 
         explicit NvCodecImageLoader(const Options& options);
