@@ -17,7 +17,10 @@
 #include "core/block_store.hpp"
 #include "core/camera.hpp"
 #include "core/logger.hpp"
+#include "core/point_cloud.hpp"
 #include "core/tiered_cache.hpp"
+#include "io/exporter.hpp"
+#include "io/formats/ply.hpp"
 #include "strategies/strategy_utils.hpp"
 #include "tide/aos_soa_repack.hpp"
 #include "tide/frustum_culler.hpp"
@@ -25,18 +28,23 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <cuda_runtime.h>
+#include <expected>
+#include <filesystem>
 #include <istream>
 #include <numeric>
+#include <optional>
 #include <ostream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace lfs::training {
 
@@ -1447,6 +1455,169 @@ namespace lfs::training {
 
     TideStrategy::PrefetchStats TideStrategy::prefetch_stats() const noexcept {
         return impl_ ? impl_->prefetch_stats : PrefetchStats{};
+    }
+
+    // --- Phase 3.5.9 Plan A: full-BlockStore PLY export ----------------------
+    //
+    // The default Trainer::save_ply path calls lfs::io::save_ply(strategy_->get_model())
+    // which on TideStrategy only sees the WorkingSet residency (typically 5-25%
+    // of the model on a 24 GB GPU at 30M+SH-3). This override walks the entire
+    // on-disk BlockStore, SoA-unpacks every block's latest revision into host
+    // vectors with the standard 3DGS PLY attribute ordering, and emits a single
+    // monolithic PLY containing every Gaussian in the model.
+    //
+    // Cost: ~248 bytes per Gaussian held in host RAM during the unpack pass
+    // (means/scaling/rotation/opacity/sh0/shN). At 28.9M splats SH-3 this is
+    // ~7.2 GiB host RAM peak — well within a 64 GB box. A future Plan A-2
+    // could stream-write the PLY without materializing all attributes at once.
+    //
+    // The SH-rest ordering transposition: BlockStore stores rest as
+    // [c0_R, c0_G, c0_B, c1_R, c1_G, c1_B, ...] (coefficient-major,
+    // channel-inner), but the canonical 3DGS PLY layout (matching `process_sh`
+    // in to_point_cloud) is [ch0_c0..ch0_c14, ch1_c0..ch1_c14, ch2_c0..ch2_c14]
+    // (channel-major, coefficient-inner). We transpose during unpack so the
+    // output PLY loads correctly in any standard viewer (Babylon / PlayCanvas /
+    // splatviewer.com / SuperSplat).
+    std::optional<std::expected<void, std::string>>
+    TideStrategy::save_full_ply(const std::filesystem::path& output_path, bool binary) {
+        if (!impl_ || !impl_->store) {
+            // No BlockStore attached — let the trainer fall back to the
+            // standard get_model()-based save path.
+            return std::nullopt;
+        }
+
+        auto& store = *impl_->store;
+        const std::size_t num_blocks = store.num_blocks();
+        const std::size_t block_size = store.block_size();
+        const std::size_t bytes_per_block = store.bytes_per_block();
+
+        if (num_blocks == 0 || block_size == 0) {
+            return std::expected<void, std::string>{};
+        }
+
+        const std::size_t total_gaussians = num_blocks * block_size;
+        constexpr std::size_t kAosFloats = tide::kAosFloatsPerGaussian; // 59
+
+        LOG_INFO("TideStrategy::save_full_ply: streaming {} blocks × {} = {} "
+                 "Gaussians (SH-3) to {}",
+                 num_blocks, block_size, total_gaussians,
+                 output_path.string());
+
+        const auto t_start = std::chrono::steady_clock::now();
+
+        // Host-side flat attribute buffers (AoS-by-Gaussian, matching the
+        // shapes expected by PointCloud → write_ply_binary).
+        std::vector<float> host_means(total_gaussians * 3);
+        std::vector<float> host_scaling(total_gaussians * 3);
+        std::vector<float> host_rotation(total_gaussians * 4);
+        std::vector<float> host_opacity(total_gaussians * 1);
+        std::vector<float> host_sh0(total_gaussians * 3);
+        std::vector<float> host_shN(total_gaussians * 45);
+
+        std::vector<std::byte> block_buf(bytes_per_block);
+
+        for (std::size_t b = 0; b < num_blocks; ++b) {
+            auto read_result = store.read_block(b, std::span<std::byte>(block_buf));
+            if (!read_result) {
+                return std::unexpected(std::format(
+                    "TideStrategy::save_full_ply: read_block({}) failed: {}",
+                    b, read_result.error()));
+            }
+
+            const float* g_base = reinterpret_cast<const float*>(block_buf.data());
+
+            for (std::size_t i = 0; i < block_size; ++i) {
+                const std::size_t gid = b * block_size + i;
+                const float* g = g_base + i * kAosFloats;
+
+                // means [N, 3]
+                host_means[gid * 3 + 0] = g[tide::kAosOffsetMeans + 0];
+                host_means[gid * 3 + 1] = g[tide::kAosOffsetMeans + 1];
+                host_means[gid * 3 + 2] = g[tide::kAosOffsetMeans + 2];
+
+                // scaling [N, 3] (raw, pre-exp)
+                host_scaling[gid * 3 + 0] = g[tide::kAosOffsetScaling + 0];
+                host_scaling[gid * 3 + 1] = g[tide::kAosOffsetScaling + 1];
+                host_scaling[gid * 3 + 2] = g[tide::kAosOffsetScaling + 2];
+
+                // rotation [N, 4] (raw quaternion xyzw; viewer normalizes)
+                host_rotation[gid * 4 + 0] = g[tide::kAosOffsetRotation + 0];
+                host_rotation[gid * 4 + 1] = g[tide::kAosOffsetRotation + 1];
+                host_rotation[gid * 4 + 2] = g[tide::kAosOffsetRotation + 2];
+                host_rotation[gid * 4 + 3] = g[tide::kAosOffsetRotation + 3];
+
+                // opacity [N, 1] (raw, pre-sigmoid)
+                host_opacity[gid] = g[tide::kAosOffsetOpacity];
+
+                // sh0 [N, 3] = DC (R, G, B) — same order in BlockStore and PLY
+                host_sh0[gid * 3 + 0] = g[tide::kAosOffsetSh0 + 0];
+                host_sh0[gid * 3 + 1] = g[tide::kAosOffsetSh0 + 1];
+                host_sh0[gid * 3 + 2] = g[tide::kAosOffsetSh0 + 2];
+
+                // shN [N, 45] — transpose coefficient-major (BlockStore) to
+                // channel-major (PLY). BlockStore: k = c*3 + ch (15 coeffs ×
+                // 3 channels). PLY: write_idx = ch*15 + c.
+                for (std::size_t k = 0; k < tide::kAosShNMaxFloats; ++k) {
+                    const std::size_t c = k / 3;
+                    const std::size_t ch = k % 3;
+                    const std::size_t write_idx = ch * 15 + c;
+                    host_shN[gid * 45 + write_idx] = g[tide::kAosOffsetShN + k];
+                }
+            }
+        }
+
+        // Build a PointCloud with CPU tensors (no GPU upload — at 28.9M ×
+        // 248 B = 7.2 GiB this would blow past the 24 GB VRAM budget).
+        lfs::core::PointCloud pc;
+        pc.means = lfs::core::Tensor::from_vector(host_means, {total_gaussians, 3}, lfs::core::Device::CPU);
+        pc.normals = lfs::core::Tensor::zeros({total_gaussians, 3}, lfs::core::Device::CPU);
+        pc.scaling = lfs::core::Tensor::from_vector(host_scaling, {total_gaussians, 3}, lfs::core::Device::CPU);
+        pc.rotation = lfs::core::Tensor::from_vector(host_rotation, {total_gaussians, 4}, lfs::core::Device::CPU);
+        pc.opacity = lfs::core::Tensor::from_vector(host_opacity, {total_gaussians, 1}, lfs::core::Device::CPU);
+        // sh0 buffer is [R, G, B] per Gaussian → shape [N, 3, 1] (channel, coeff).
+        // shN buffer is [ch*15 + c] per Gaussian → shape [N, 3, 15] (channel, coeff).
+        // This matches PointCloud's documented shape convention and the layout
+        // expected by write_ply_binary's f_rest_* attribute enumeration.
+        pc.sh0 = lfs::core::Tensor::from_vector(host_sh0, {total_gaussians, 3, 1}, lfs::core::Device::CPU);
+        pc.shN = lfs::core::Tensor::from_vector(host_shN, {total_gaussians, 3, 15}, lfs::core::Device::CPU);
+
+        // 3DGS PLY attribute name order matches to_point_cloud/get_ply_attribute_names:
+        // x y z nx ny nz f_dc_0..2 f_rest_0..44 opacity scale_0..2 rot_0..3.
+        pc.attribute_names = {"x", "y", "z", "nx", "ny", "nz"};
+        pc.attribute_names.reserve(6 + 3 + 45 + 1 + 3 + 4);
+        for (int i = 0; i < 3; ++i) pc.attribute_names.push_back("f_dc_" + std::to_string(i));
+        for (int i = 0; i < 45; ++i) pc.attribute_names.push_back("f_rest_" + std::to_string(i));
+        pc.attribute_names.push_back("opacity");
+        for (int i = 0; i < 3; ++i) pc.attribute_names.push_back("scale_" + std::to_string(i));
+        for (int i = 0; i < 4; ++i) pc.attribute_names.push_back("rot_" + std::to_string(i));
+
+        const auto t_unpacked = std::chrono::steady_clock::now();
+        const auto unpack_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_unpacked - t_start).count();
+        LOG_INFO("TideStrategy::save_full_ply: unpacked {} Gaussians from {} blocks in {} ms — writing PLY",
+                 total_gaussians, num_blocks, unpack_ms);
+
+        // Force synchronous binary write — the async path would let our host
+        // vectors go out of scope while the writer is still consuming them.
+        // Plan A is correctness-first; throughput from-disk-to-disk on this
+        // path is dominated by sequential read of the BlockStore anyway.
+        const lfs::io::PlySaveOptions opts{
+            .output_path = output_path,
+            .binary = binary,
+            .async = false};
+
+        auto save_result = lfs::io::save_ply(pc, opts);
+        if (!save_result) {
+            return std::unexpected(std::format(
+                "TideStrategy::save_full_ply: lfs::io::save_ply failed: {}",
+                save_result.error().message));
+        }
+
+        const auto t_done = std::chrono::steady_clock::now();
+        const auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_done - t_start).count();
+        LOG_INFO("TideStrategy::save_full_ply: wrote {} Gaussians to {} in {} ms total",
+                 total_gaussians, output_path.string(), total_ms);
+
+        return std::expected<void, std::string>{};
     }
 
 } // namespace lfs::training

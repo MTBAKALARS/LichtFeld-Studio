@@ -7,9 +7,13 @@
 #include "core/parameters.hpp"
 #include "core/splat_data.hpp"
 #include "optimizer/render_output.hpp"
+#include <expected>
+#include <filesystem>
 #include <istream>
 #include <memory>
+#include <optional>
 #include <ostream>
+#include <string>
 
 namespace lfs::io {
     class PipelinedImageLoader;
@@ -95,5 +99,21 @@ namespace lfs::training {
         virtual void set_training_dataset(std::shared_ptr<CameraDataset>) {}
 
         virtual void set_image_loader(lfs::io::PipelinedImageLoader*) {}
+
+        /// Phase 3.5.9 Plan A: optional hook for strategies whose @ref get_model()
+        /// represents only a subset of the strategy's full trainable state (e.g.
+        /// @ref TideStrategy::get_model returns just the resident WorkingSet of a
+        /// much larger on-disk BlockStore — typically <25% of the full model on a
+        /// 24 GB GPU at 30M+SH-3). The default implementation returns
+        /// std::nullopt, signaling "no override — use the standard
+        /// lfs::io::save_ply(get_model(), opts) path". Strategies that override
+        /// this MUST write a binary 3DGS PLY containing every Gaussian in their
+        /// full model to @p output_path and return the result. The trainer's
+        /// @ref Trainer::save_ply call dispatches through this hook before
+        /// falling back to the standard path.
+        virtual std::optional<std::expected<void, std::string>>
+        save_full_ply(const std::filesystem::path& /*output_path*/, bool /*binary*/) {
+            return std::nullopt;
+        }
     };
 } // namespace lfs::training

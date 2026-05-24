@@ -114,6 +114,16 @@ namespace lfs::training {
         void reserve_optimizer_capacity(size_t capacity) override;
         void set_optimization_params(const lfs::core::param::OptimizationParameters& params) override;
 
+        /// Phase 3.5.9 Plan A: stream the entire on-disk BlockStore through a
+        /// binary 3DGS PLY at @p output_path, bypassing the WorkingSet that
+        /// @ref get_model returns. Returns std::nullopt iff no BlockStore is
+        /// attached (in which case the trainer falls back to the standard
+        /// save path). When attached, every block's latest revision is
+        /// SoA-unpacked into per-attribute host vectors and written via the
+        /// standard `lfs::io::save_ply(PointCloud, ...)` synchronous path.
+        std::optional<std::expected<void, std::string>>
+        save_full_ply(const std::filesystem::path& output_path, bool binary) override;
+
         // Phase 3.2b test accessors ----------------------------------------
         /// SOA scratch capacity in Gaussians (== number of Gaussians in the
         /// view-backed SplatData after `initialize`).

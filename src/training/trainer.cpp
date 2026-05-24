@@ -3107,7 +3107,24 @@ namespace lfs::training {
             .binary = true,
             .async = !join_threads};
 
-        const auto ply_result = lfs::io::save_ply(strategy_->get_model(), ply_options);
+        // Phase 3.5.9 Plan A: dispatch through optional IStrategy::save_full_ply
+        // hook FIRST. Tide-class strategies override this to stream the entire
+        // BlockStore through PLY rather than just the WorkingSet residency that
+        // get_model() represents. Non-tide strategies return std::nullopt and
+        // fall through to the standard lfs::io::save_ply path below.
+        std::optional<lfs::io::Result<void>> ply_result_opt;
+        if (auto strategy_custom = strategy_->save_full_ply(ply_options.output_path, ply_options.binary)) {
+            if (!*strategy_custom) {
+                LOG_WARN("Strategy save_full_ply failed: {}", strategy_custom->error());
+                return; // Don't save checkpoint if PLY failed
+            }
+            // Override succeeded — synthesize a Result<void>{} for the
+            // downstream control flow that expects a ply_result variable.
+            ply_result_opt.emplace(lfs::io::Result<void>{});
+        } else {
+            ply_result_opt.emplace(lfs::io::save_ply(strategy_->get_model(), ply_options));
+        }
+        const auto& ply_result = *ply_result_opt;
         if (!ply_result) {
             if (ply_result.error().code == lfs::io::ErrorCode::INSUFFICIENT_DISK_SPACE) {
                 lfs::core::events::state::DiskSpaceSaveFailed{
